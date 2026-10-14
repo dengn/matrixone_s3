@@ -1,0 +1,120 @@
+{
+  "cases": [
+    {
+      "case": "01_notebook_to_pandas",
+      "status": "passed",
+      "elapsed_ms": 11.209,
+      "rows": 3,
+      "result": [
+        {
+          "region": "east",
+          "orders": 8,
+          "revenue": 554.0
+        },
+        {
+          "region": "north",
+          "orders": 8,
+          "revenue": 594.0
+        },
+        {
+          "region": "west",
+          "orders": 8,
+          "revenue": 394.0
+        }
+      ]
+    },
+    {
+      "case": "02_local_dataframe_join",
+      "status": "passed",
+      "elapsed_ms": 29.421,
+      "uploaded_rows": 4,
+      "result": [
+        {
+          "experiment_group": "control",
+          "orders": 4,
+          "revenue": 77.0
+        },
+        {
+          "experiment_group": "test",
+          "orders": 4,
+          "revenue": 317.0
+        }
+      ]
+    },
+    {
+      "case": "03_client_csv_exploration",
+      "status": "passed",
+      "elapsed_ms": 31.19,
+      "uploaded_rows": 24,
+      "result": [
+        {
+          "orders": 16,
+          "revenue": 1348.0
+        }
+      ]
+    },
+    {
+      "case": "04_incremental_update_and_rollback",
+      "status": "passed",
+      "elapsed_ms": 29.438,
+      "before": 1542.0,
+      "after": 1554.0,
+      "separate_reader": true,
+      "rollback_verified": true
+    },
+    {
+      "case": "05_snapshot_to_sklearn",
+      "status": "passed",
+      "elapsed_ms": 66.021,
+      "training_rows": 12,
+      "predictions": [
+        0,
+        1,
+        0,
+        1,
+        0,
+        1,
+        0,
+        1,
+        0,
+        1,
+        0,
+        1
+      ],
+      "reproducible_after_update": true
+    }
+  ],
+  "all_passed": true,
+  "versions": {
+    "matrixone-python-sdk": "0.1.16",
+    "pandas": "3.0.6",
+    "duckdb": "1.5.6",
+    "scikit-learn": "1.9.1",
+    "SQLAlchemy": "2.1.4"
+  },
+  "backend": "999.0.0",
+  "scope": "SDK integration correctness; not a cloud/S3 performance benchmark",
+  "validation": {
+    "sdk_distribution": "PyPI matrixone-python-sdk==0.1.16",
+    "sdk_source_review_commit": "944b721d1b3705cdb51d1e26f1a04611a08c8401",
+    "server_binary_sha256": "49d2d31eeb6c8b3151612aa10314c1081cb47908410e7321fae389b0db0c80e7",
+    "server_mode": "ordinary native launch, DISK filesystem; no --bucket-config",
+    "connection": "local loopback MySQL protocol; production MOCloud not tested",
+    "data": {
+      "customers": 12,
+      "initial_orders": 24,
+      "cohort_rows": 4
+    },
+    "cleanup_verified": true,
+    "owned_server_stopped": true,
+    "source_sdk_run_also_passed": true,
+    "reviewed_source_matches_pypi": {
+      "client.py": true,
+      "load_data.py": false,
+      "snapshot.py": true
+    },
+    "server_build_commit": "23d8f61252f3017dff218b530817a240206fd762",
+    "server_build_vcs_modified": false,
+    "load_data_source_difference": "Parquet dictionary-encoding documentation only; CSV paths passed for both packages"
+  }
+}

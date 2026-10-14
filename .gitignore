@@ -16,6 +16,7 @@
 *.swp
 *.fatbin
 *.py
+!examples/data_science/*.py
 !cgo/test_gpu_toolchain.py
 !pkg/iceberg/metadata/testdata/generate_golden_vectors.py
 !optools/iceberg_external_runner.py
