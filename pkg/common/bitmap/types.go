@@ -1,0 +1,36 @@
+// Copyright 2021 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package bitmap
+
+type Iterator interface {
+	HasNext() bool
+	Next() uint64
+	PeekNext() uint64
+}
+
+type Bitmap struct {
+	count int64 //in version 1, we use emptyFlag with type int32 to indicate whether it is empty
+	// taggedLen stores the logical length directly for Go-owned backing and its
+	// bitwise complement for caller-owned backing. This keeps Bitmap's footprint
+	// unchanged while making backing ownership explicit.
+	taggedLen int64
+	data      []uint64
+}
+
+type BitmapIterator struct {
+	i        uint64
+	bm       *Bitmap
+	has_next bool
+}

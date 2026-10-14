@@ -1,0 +1,456 @@
+// Copyright 2024 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package bootstrap
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/matrixorigin/matrixone/pkg/bootstrap/versions"
+	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/txn/client"
+	"github.com/matrixorigin/matrixone/pkg/util/executor"
+)
+
+// MaybeUpgradeTenant used to check the tenant need upgrade or not. If need upgrade, it will
+// upgrade the tenant immediately in current txn. The callback's version is only
+// a hint: mo_account.create_version is authoritative, including for accounts an
+// old CN creates after the background upgrade's account-range snapshot.
+func (s *service) MaybeUpgradeTenant(
+	ctx context.Context,
+	tenantFetchFunc func() (int32, string, error),
+	txnOp client.TxnOperator) (bool, error) {
+	tenantID, _, err := tenantFetchFunc()
+	if err != nil {
+		return false, err
+	}
+
+	s.mu.RLock()
+	checked := s.mu.tenants[tenantID]
+	s.mu.RUnlock()
+	if checked {
+		return false, nil
+	}
+
+	upgraded := false
+	opts := executor.Options{}.WithTxn(txnOp).
+		WithAccountID(catalog.System_Account).
+		WithDatabase(catalog.MO_CATALOG).
+		WithMinCommittedTS(s.now()).
+		WithWaitCommittedLogApplied()
+	err = s.exec.ExecTxn(
+		ctx,
+		func(txn executor.TxnExecutor) error {
+			txn.Use(catalog.MO_CATALOG)
+			version, err := versions.GetTenantVersion(tenantID, txn)
+			if err != nil {
+				return err
+			}
+			// Check the persisted account version, not the serving CN's version.
+			currentCN := s.getFinalVersionHandle().Metadata()
+			if currentCN.Version == version {
+				return nil
+			} else if versions.Compare(currentCN.Version, version) < 0 {
+				// tenant create at 1.4.0, current tenant version 1.5.0, it must be cannot work
+				return moerr.NewInvalidInputNoCtxf("tenant version %s is greater than current cn version %s",
+					version, currentCN.Version)
+			}
+
+			// arrive here means tenant version < current cn version, need upgrade.
+			// and currentCN.Version == last cluster version
+
+			latestVersion, err := versions.GetLatestVersion(txn)
+			if err != nil {
+				return err
+			}
+			if latestVersion.Version != currentCN.Version {
+				return moerr.NewInvalidStateNoCtxf(
+					"tenant upgrade requires current cn version %s to match cluster latest version %s",
+					currentCN.Version, latestVersion.Version)
+			}
+
+			for {
+				// A restarted CN may not have observed completion locally. The
+				// persisted ready state also permits late-account compensation.
+				if latestVersion.IsReady() || s.upgrade.finalVersionCompleted.Load() {
+					break
+				}
+
+				upgrades, err := versions.GetUpgradeVersions(latestVersion.Version, latestVersion.VersionOffset, txn, false, true)
+				if err != nil {
+					return err
+				}
+				// latest cluster is already upgrade completed
+				if upgrades[len(upgrades)-1].State == versions.StateUpgradingTenant ||
+					upgrades[len(upgrades)-1].State == versions.StateReady {
+					break
+				}
+
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(time.Second):
+				}
+			}
+
+			// upgrade in current goroutine immediately
+			version, err = versions.GetTenantCreateVersionForUpdate(tenantID, txn)
+			if err != nil {
+				return err
+			}
+			if versions.Compare(version, currentCN.Version) > 0 {
+				return moerr.NewInvalidInputNoCtxf("tenant version %s is greater than current cn version %s",
+					version, currentCN.Version)
+			}
+			from := version
+			for _, v := range s.handles {
+				if versions.Compare(v.Metadata().Version, from) > 0 &&
+					v.Metadata().CanDirectUpgrade(from) {
+					if err := v.HandleTenantUpgrade(ctx, tenantID, txn); err != nil {
+						return err
+					}
+					if err := versions.UpgradeTenantVersion(tenantID, v.Metadata().Version, txn); err != nil {
+						return err
+					}
+					from = v.Metadata().Version
+					upgraded = true
+				}
+			}
+			if from != currentCN.Version {
+				return moerr.NewInvalidInputNoCtxf("cannot upgrade tenant version %s to current cn version %s",
+					from, currentCN.Version)
+			}
+			return nil
+		},
+		opts)
+	if err != nil {
+		return false, err
+	}
+	// A caller-owned transaction can still roll back; only cache committed checks.
+	if txnOp == nil {
+		s.mu.Lock()
+		s.mu.tenants[tenantID] = true
+		s.mu.Unlock()
+	}
+	return upgraded, nil
+}
+
+// shouldRunTenantUpgrade keeps the normal version-transition behavior (a tenant
+// already at the target version is skipped), but reruns an offset-only upgrade.
+// mo_account.create_version does not store a version offset, so FromVersion ==
+// ToVersion is the signal that an equal-version tenant still needs this step.
+func shouldRunTenantUpgrade(createVersion string, upgrade versions.VersionUpgrade) bool {
+	tenantVersionCompare := versions.Compare(createVersion, upgrade.ToVersion)
+	if tenantVersionCompare < 0 {
+		return true
+	}
+	return tenantVersionCompare == 0 &&
+		versions.Compare(upgrade.FromVersion, upgrade.ToVersion) == 0
+}
+
+// newTenantUpgradePass returns one transactional tenant-upgrade pass. Keeping
+// the pass independent from the periodic task makes completion observable
+// without coupling callers (or tests) to the task's wall clock.
+func (s *service) newTenantUpgradePass(ctx context.Context) func() (bool, error) {
+	return func() (bool, error) {
+		ctx, cancel := context.WithTimeoutCause(ctx, time.Hour*24, moerr.CauseAsyncUpgradeTenantTask)
+		defer cancel()
+
+		hasUpgradeTenants := false
+		opts := executor.Options{}.
+			WithDatabase(catalog.MO_CATALOG).
+			WithMinCommittedTS(s.now()).
+			WithWaitCommittedLogApplied().
+			WithTimeZone(time.Local)
+		err := s.exec.ExecTxn(
+			ctx,
+			func(txn executor.TxnExecutor) error {
+				upgrade, ok, err := versions.GetUpgradingTenantVersion(txn)
+				if err != nil {
+					s.logger.Error("failed to get upgrading tenant version",
+						zap.Error(err))
+					return err
+				}
+
+				s.logger.Debug("get upgrading tenant version",
+					zap.String("upgrade", upgrade.String()),
+					zap.Bool("has", ok))
+				if !ok || upgrade.TotalTenant == upgrade.ReadyTenant {
+					return nil
+				}
+
+				// no upgrade logic on current cn, skip
+				v := s.getFinalVersionHandle().Metadata().Version
+				if versions.Compare(upgrade.ToVersion, v) > 0 {
+					s.logger.Info("skip upgrade tenant",
+						zap.String("final", v),
+						zap.String("to", upgrade.ToVersion))
+					return nil
+				}
+
+				// select task and tenants for update
+				taskID, tenants, createVersions, hasDeletedTenantTasks, hasConflictTenantTasks, err := versions.GetUpgradeTenantTasks(upgrade.ID, txn)
+				if err != nil {
+					s.logger.Error("failed to load upgrade tenants",
+						zap.String("upgrade", upgrade.String()),
+						zap.Error(err))
+					return err
+				}
+
+				s.logger.Debug("load upgrade tenants",
+					zap.Int("count", len(tenants)),
+					zap.String("upgrade", upgrade.String()))
+				if len(tenants) == 0 {
+					hasUnreadyTasks, err := versions.HasUnreadyUpgradeTenantTasks(upgrade.ID, txn)
+					if err != nil {
+						s.logger.Error("failed to check remaining tenant upgrade tasks",
+							zap.String("upgrade", upgrade.String()),
+							zap.Error(err))
+						return err
+					}
+					if hasConflictTenantTasks {
+						return nil
+					}
+
+					reconciledDeletedTaskCount := int64(0)
+					if hasUnreadyTasks {
+						reconciledDeletedTaskCount, err = versions.ReconcileDeletedUpgradeTenantTasks(upgrade.ID, txn)
+						if err != nil {
+							s.logger.Error("failed to reconcile deleted tenant upgrade tasks",
+								zap.String("upgrade", upgrade.String()),
+								zap.Error(err))
+							return err
+						}
+						hasUnreadyTasks, err = versions.HasUnreadyUpgradeTenantTasks(upgrade.ID, txn)
+						if err != nil {
+							s.logger.Error("failed to recheck remaining tenant upgrade tasks",
+								zap.String("upgrade", upgrade.String()),
+								zap.Error(err))
+							return err
+						}
+						if hasUnreadyTasks {
+							return nil
+						}
+					}
+
+					reloadedUpgrade, err := versions.GetUpgradeVersionForUpdateByID(upgrade.ID, txn)
+					if err != nil {
+						s.logger.Error("failed to reload upgrade after tenant task reconciliation",
+							zap.String("upgrade", upgrade.String()),
+							zap.Error(err))
+						return err
+					}
+					if reloadedUpgrade.ReadyTenant >= reloadedUpgrade.TotalTenant {
+						return nil
+					}
+					reloadedUpgrade.ReadyTenant = reloadedUpgrade.TotalTenant
+					fields := []zap.Field{
+						zap.String("upgrade", reloadedUpgrade.String()),
+						zap.Int64("reconciled-deleted-task-count", reconciledDeletedTaskCount),
+						zap.Bool("deleted-tenant-tasks-detected", hasDeletedTenantTasks),
+					}
+					if reconciledDeletedTaskCount > 0 {
+						s.logger.Warn("tenant upgrade task counters reconciled to current tenants", fields...)
+					} else {
+						s.logger.Info("tenant upgrade task counters reconciled to current tenants", fields...)
+					}
+					return versions.UpdateVersionUpgradeTasks(reloadedUpgrade, txn)
+				}
+
+				hasUpgradeTenants = true
+				h := s.getVersionHandle(upgrade.ToVersion)
+				updated := int32(0)
+				for i, id := range tenants {
+					createVersion := createVersions[i]
+
+					s.logger.Info("upgrade tenant",
+						zap.Int32("tenant", id),
+						zap.String("tenant-version", createVersion),
+						zap.String("upgrade", upgrade.String()))
+
+					if !shouldRunTenantUpgrade(createVersion, upgrade) {
+						continue
+					}
+
+					s.logger.Info("execute upgrade tenant",
+						zap.Int32("tenant", id),
+						zap.String("tenant-version", createVersion),
+						zap.String("upgrade", upgrade.String()))
+
+					if err = h.HandleTenantUpgrade(ctx, id, txn); err != nil {
+						s.logger.Error("failed to execute upgrade tenant",
+							zap.Int32("tenant", id),
+							zap.String("tenant-version", createVersion),
+							zap.String("upgrade", upgrade.String()),
+							zap.Error(err))
+						return err
+					}
+
+					if err = versions.UpgradeTenantVersion(id, h.Metadata().Version, txn); err != nil {
+						s.logger.Error("failed to update upgrade tenant create version",
+							zap.Int32("tenant", id),
+							zap.String("upgrade", upgrade.String()),
+							zap.Error(err))
+						return err
+					}
+
+					s.logger.Info("execute upgrade tenant completed",
+						zap.Int32("tenant", id),
+						zap.String("tenant-version", createVersion),
+						zap.String("upgrade", upgrade.String()))
+					updated++
+				}
+
+				if err = versions.UpdateUpgradeTenantTaskState(taskID, versions.Yes, txn); err != nil {
+					s.logger.Error("failed to update upgrade tenant state",
+						zap.String("upgrade", upgrade.String()))
+					return err
+				}
+				s.logger.Info("tenant state updated",
+					zap.Int32("from", tenants[0]),
+					zap.Int32("to", tenants[len(tenants)-1]),
+					zap.String("upgrade", upgrade.String()))
+
+				// update count, we need using select for update to avoid concurrent update
+				upgrade, err = versions.GetUpgradeVersionForUpdateByID(upgrade.ID, txn)
+				if err != nil {
+					s.logger.Error("failed to get latest upgrade info",
+						zap.String("upgrade", upgrade.String()))
+					return err
+				}
+
+				upgrade.ReadyTenant += updated
+				if upgrade.TotalTenant < upgrade.ReadyTenant {
+					s.logger.Error("invalid upgrade tenant",
+						zap.String("upgrade", upgrade.String()),
+						zap.Int32("updated", updated),
+					)
+					return moerr.NewInvalidStateNoCtx("orphan txn or pre lock released by lock table changed")
+				}
+
+				s.logger.Info("upgrade tenant ready count changed",
+					zap.String("upgrade", upgrade.String()))
+
+				if upgrade.State == versions.StateReady {
+					return nil
+				}
+				return versions.UpdateVersionUpgradeTasks(upgrade, txn)
+			},
+			opts)
+		if err != nil {
+			err = moerr.AttachCause(ctx, err)
+			s.logger.Error("tenant task handle failed",
+				zap.Error(err))
+			return false, err
+		}
+		if !hasUpgradeTenants && s.upgrade.finalVersionCompleted.Load() {
+			if err := s.maintainOrphanObjectPrivileges(ctx); err != nil {
+				err = moerr.AttachCause(ctx, err)
+				s.logger.Error("orphan object privilege maintenance failed", zap.Error(err))
+				return false, err
+			}
+		}
+		return hasUpgradeTenants, nil
+	}
+}
+
+// asyncUpgradeTenantTask is a task to execute the tenant upgrade logic in
+// parallel based on the grouped tenant batch.
+func (s *service) asyncUpgradeTenantTask(ctx context.Context) {
+	fn := s.newTenantUpgradePass(ctx)
+	timer := time.NewTimer(s.upgrade.checkUpgradeTenantDuration)
+	defer timer.Stop()
+
+	maintenanceOwner := false
+	defer func() {
+		if maintenanceOwner {
+			s.upgrade.orphanPrivilegeMaintenanceWorkerRunning.Store(false)
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			if s.upgrade.finalVersionCompleted.Load() && !maintenanceOwner {
+				// Tenant upgrade workers used to exit at this point. Keep only one
+				// of them as the process-local periodic maintenance owner; this also
+				// prevents manual upgrade pre-checks from accumulating permanent
+				// maintenance workers.
+				if !s.upgrade.orphanPrivilegeMaintenanceWorkerRunning.CompareAndSwap(false, true) {
+					return
+				}
+				maintenanceOwner = true
+			}
+			drainUpgradeTenants(ctx, fn)
+			timer.Reset(s.upgrade.checkUpgradeTenantDuration)
+		}
+	}
+}
+
+func drainUpgradeTenants(ctx context.Context, fn func() (bool, error)) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		hasUpgradeTenants, err := fn()
+		if err != nil || !hasUpgradeTenants {
+			return
+		}
+	}
+}
+
+func fetchTenants(
+	batch int,
+	fn func([]int32) error,
+	txn executor.TxnExecutor) error {
+	last := int32(-1)
+	var ids []int32
+	for {
+		ids = ids[:0]
+		sql := fmt.Sprintf("select account_id from mo_account where account_id > %d order by account_id limit %d",
+			last,
+			batch)
+		res, err := txn.Exec(sql, executor.StatementOption{})
+		if err != nil {
+			return err
+		}
+		n := 0
+		res.ReadRows(func(rows int, cols []*vector.Vector) bool {
+			for i := 0; i < rows; i++ {
+				last = vector.GetFixedAtWithTypeCheck[int32](cols[0], i)
+				ids = append(ids, last)
+				n++
+			}
+			return true
+		})
+		res.Close()
+		if n == 0 {
+			return nil
+		}
+		if err := fn(ids); err != nil {
+			return err
+		}
+	}
+}

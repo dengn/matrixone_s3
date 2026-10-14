@@ -1,0 +1,977 @@
+// Copyright 2020 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package csvparser
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"regexp"
+	"slices"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/util"
+	"github.com/matrixorigin/matrixone/pkg/config"
+	"github.com/spkg/bom"
+)
+
+var (
+	errUnterminatedQuotedField       = moerr.NewInvalidInputNoCtx("csvParser error: unterminated quoted field")
+	errDanglingBackslash             = moerr.NewInvalidInputNoCtx("csvParser error: no character after backslash")
+	errUnexpectedQuoteField          = moerr.NewInvalidInputNoCtx("csvParser error: cannot have consecutive fields without separator")
+	BufferSizeScale                  = int64(5)
+	ReadBlockSize              int64 = 64 * 1024
+)
+
+type Field struct {
+	Val            string
+	IsNull         bool
+	HasStringQuote bool
+}
+
+type escapeFlavor uint8
+
+const (
+	escapeFlavorNone escapeFlavor = iota
+	escapeFlavorMySQL
+	escapeFlavorMySQLWithNull
+)
+
+type CSVConfig struct {
+	// they can only be used by LOAD DATA
+	// https://dev.mysql.com/doc/refman/8.0/en/load-data.html#load-data-field-line-handling
+	LinesStartingBy   string
+	LinesTerminatedBy string
+
+	FieldsTerminatedBy string
+	FieldsEnclosedBy   string
+	FieldsEscapedBy    string
+
+	Null              []string
+	Header            bool
+	HeaderSchemaMatch bool
+	TrimLastSep       bool
+	NotNull           bool
+
+	AllowEmptyLine bool
+	// For non-empty FieldsEnclosedBy (for example quotes), null elements inside quotes are not considered as null except for
+	// `\N` (when escape-by is `\`). That is to say, `\N` is special for null because it always means null.
+	QuotedNullIsText bool
+	// ref https://dev.mysql.com/doc/refman/8.0/en/load-data.html
+	// > If the field begins with the ENCLOSED BY character, instances of that character are recognized as terminating a
+	// > field value only if followed by the field or line TERMINATED BY sequence.
+	// This means we will meet unescaped quote in a quoted field
+	// > The "BIG" boss      -> The "BIG" boss
+	// This means we will meet unescaped quote in an unquoted field
+	UnescapedQuote bool
+
+	// Comment is the comment marker: a line whose RAW prefix (before unquoting)
+	// equals it is skipped. The empty string (the default) means no comment
+	// marker, so every line is data — an enclosed value like "#x" is always
+	// data regardless, since its raw prefix is the enclosure char.
+	Comment string
+}
+
+// CSVParser is basically a copy of encoding/csv, but special-cased for MySQL-like input.
+type CSVParser struct {
+	cfg *CSVConfig
+
+	comma          []byte
+	quote          []byte
+	newLine        []byte
+	startingBy     []byte
+	escapedBy      string
+	unescapeRegexp *regexp.Regexp
+
+	// These variables are used with IndexAnyByte to search a byte slice for the
+	// first index which some special character may appear.
+	// quoteByteSet is used inside quoted fields (so the first characters of
+	// the closing delimiter and backslash are special).
+	// unquoteByteSet is used outside quoted fields (so the first characters
+	// of the opening delimiter, separator, terminator and backslash are
+	// special).
+	// newLineByteSet is used in strict-format CSV dividing (so the first
+	// characters of the terminator are special).
+	quoteByteSet   byteSet
+	unquoteByteSet byteSet
+	newLineByteSet byteSet
+
+	// recordBuffer holds the unescaped fields, one after another.
+	// The fields can be accessed by using the indexes in fieldIndexes.
+	// E.g., For the row `a,"b","c""d",e`, recordBuffer will contain `abc"de`
+	// and fieldIndexes will contain the indexes [1, 2, 5, 6].
+	recordBuffer []byte
+
+	// fieldIndexes is an index of fields inside recordBuffer.
+	// The width field ends at offset fieldIndexes[i] in recordBuffer.
+	fieldIndexes  []int
+	fieldIsQuoted []bool
+
+	LastRow []Field
+
+	escFlavor escapeFlavor
+	// if set to true, csv parser will treat the first non-empty line as header line
+	shouldParseHeader bool
+	// in LOAD DATA, empty line should be treated as a valid field
+	allowEmptyLine   bool
+	quotedNullIsText bool
+	unescapedQuote   bool
+	isLastChunk      bool
+
+	// see csv.Reader
+	comment []byte
+
+	reader io.Reader
+	// stores data that has NOT been parsed yet, it shares same memory as appendBuf.
+	buf []byte
+	// used to read data from the reader, the data will be moved to other buffers.
+	blockBuf []byte
+
+	// The list of column names of the last INSERT statement.
+	columns []string
+
+	// the reader position we have parsed, if the underlying reader is not
+	// a compressed file, it's the file position we have parsed too.
+	// this value may go backward when failed to read quoted field, but it's
+	// for printing error message, and the parser should not be used later,
+	// so it's ok, see readQuotedField.
+	pos int64
+	// lineNo counts the newline bytes consumed so far, and recordStartLine is
+	// lineNo at the first content byte of the record being read. Together they
+	// give the PHYSICAL line a record starts on — for a multi-line quoted field,
+	// its first line. Every byte the parser consumes passes through readByte,
+	// skipBytes or readUntil, so counting there is exact.
+	lineNo          int64
+	recordStartLine int64
+
+	// cache
+	remainBuf *bytes.Buffer
+	appendBuf *bytes.Buffer
+}
+
+// Reset re-points the parser at a new input stream and clears all buffered
+// stream state (buf/pos/chunk flags and scratch buffers), so one parser —
+// and its large block buffer — can be reused across many small independent
+// inputs with no possibility of cross-input bleed. Configuration and the
+// per-record scratch space are kept.
+func (parser *CSVParser) Reset(reader io.Reader) {
+	parser.reader = reader
+	parser.buf = nil
+	parser.pos = 0
+	parser.lineNo = 0
+	parser.recordStartLine = 0
+	parser.isLastChunk = false
+	parser.remainBuf.Reset()
+	parser.appendBuf.Reset()
+}
+
+// NewCSVParser creates a CSV parser.
+func NewCSVParser(
+	cfg *CSVConfig,
+	reader io.Reader,
+	blockBufSize int64,
+	shouldParseHeader bool,
+) (*CSVParser, error) {
+	// see csv.Reader
+	if !validDelim(rune(cfg.FieldsTerminatedBy[0])) {
+		return nil, moerr.NewInvalidInputNoCtx("invalid field delimiter")
+	}
+	// The comment marker is matched as a raw line prefix (see readRecord), so it
+	// no longer shares the tokenizer's byte stop-sets and cannot collide with
+	// the field terminator the way a single-byte marker did; only whether it is
+	// empty or not is meaningful here.
+
+	var err error
+	var separator, delimiter, terminator string
+
+	separator = cfg.FieldsTerminatedBy
+	delimiter = cfg.FieldsEnclosedBy
+	terminator = cfg.LinesTerminatedBy
+
+	if terminator == "\r\n" {
+		terminator = "\n"
+	}
+
+	var quoteStopSet, newLineStopSet []byte
+	unquoteStopSet := []byte{separator[0]}
+	if len(delimiter) > 0 {
+		quoteStopSet = []byte{delimiter[0]}
+		unquoteStopSet = append(unquoteStopSet, delimiter[0])
+	}
+	if len(terminator) > 0 {
+		newLineStopSet = []byte{terminator[0]}
+	} else {
+		// The character set encoding of '\r' and '\n' is the same in UTF-8 and GBK.
+		newLineStopSet = []byte{'\r', '\n'}
+	}
+	unquoteStopSet = append(unquoteStopSet, newLineStopSet...)
+
+	if len(cfg.LinesStartingBy) > 0 {
+		if strings.Contains(cfg.LinesStartingBy, terminator) {
+			return nil, moerr.NewInvalidInputNoCtx(fmt.Sprintf("STARTING BY '%s' cannot contain LINES TERMINATED BY '%s'", cfg.LinesStartingBy, terminator))
+		}
+	}
+
+	escFlavor := escapeFlavorNone
+	var r *regexp.Regexp
+
+	if len(cfg.FieldsEscapedBy) > 0 {
+		escFlavor = escapeFlavorMySQL
+		quoteStopSet = append(quoteStopSet, cfg.FieldsEscapedBy[0])
+		unquoteStopSet = append(unquoteStopSet, cfg.FieldsEscapedBy[0])
+		// we need special treatment of the NULL value \N, used by MySQL.
+		if !cfg.NotNull && slices.Contains(cfg.Null, cfg.FieldsEscapedBy+`N`) {
+			escFlavor = escapeFlavorMySQLWithNull
+		}
+		r, err = regexp.Compile(`(?s)` + regexp.QuoteMeta(cfg.FieldsEscapedBy) + `.`)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &CSVParser{
+		reader:            reader,
+		blockBuf:          make([]byte, blockBufSize*BufferSizeScale),
+		remainBuf:         &bytes.Buffer{},
+		appendBuf:         &bytes.Buffer{},
+		cfg:               cfg,
+		comma:             []byte(separator),
+		quote:             []byte(delimiter),
+		newLine:           []byte(terminator),
+		startingBy:        []byte(cfg.LinesStartingBy),
+		escapedBy:         cfg.FieldsEscapedBy,
+		unescapeRegexp:    r,
+		escFlavor:         escFlavor,
+		comment:           []byte(cfg.Comment),
+		quoteByteSet:      makeByteSet(quoteStopSet),
+		unquoteByteSet:    makeByteSet(unquoteStopSet),
+		newLineByteSet:    makeByteSet(newLineStopSet),
+		shouldParseHeader: shouldParseHeader,
+		allowEmptyLine:    cfg.AllowEmptyLine,
+		quotedNullIsText:  cfg.QuotedNullIsText,
+		unescapedQuote:    cfg.UnescapedQuote,
+	}, nil
+}
+func (parser *CSVParser) Read(lastRow []Field) (row []Field, err error) {
+	row, err = parser.readRow(lastRow)
+	return row, err
+}
+
+func (parser *CSVParser) Pos() int64 {
+	return parser.pos
+}
+
+// RecordLine returns the 1-based physical line the most recently read record
+// starts on. For a record whose quoted field spans several lines, this is its
+// FIRST line.
+func (parser *CSVParser) RecordLine() int64 {
+	return parser.recordStartLine + 1
+}
+
+func validDelim(r rune) bool {
+	return r != 0 && r != '"' && r != '\r' && r != '\n' && utf8.ValidRune(r) && r != utf8.RuneError
+}
+
+// readRow reads a row from the datafile.
+func (parser *CSVParser) readRow(row []Field) ([]Field, error) {
+	// skip the header first
+	if parser.shouldParseHeader {
+		err := parser.readColumns()
+		if err != nil {
+			return nil, err
+		}
+		parser.shouldParseHeader = false
+	}
+
+	if err := parser.readRecord(); err != nil {
+		return nil, err
+	}
+
+	str := util.UnsafeBytesToString(parser.recordBuffer) // convert byte to string using unsafe, reduce memory allocgit
+	// remove the last empty value
+	if parser.cfg.TrimLastSep {
+		i := len(parser.fieldIndexes) - 1
+		if i >= 0 && len(str[parser.fieldIndexes[i]:]) == 0 {
+			parser.fieldIndexes = parser.fieldIndexes[:len(parser.fieldIndexes)-1]
+		}
+	}
+
+	row = row[:0]
+	if cap(row) < len(parser.fieldIndexes) {
+		row = make([]Field, len(parser.fieldIndexes))
+	}
+	row = row[:len(parser.fieldIndexes)]
+	var preIdx int
+	for i, idx := range parser.fieldIndexes {
+		unescaped, isNull, err := parser.unescapeString(str[preIdx:idx], parser.fieldIsQuoted[i])
+		if err != nil {
+			return nil, err
+		}
+		row[i].IsNull = isNull
+		row[i].Val = unescaped
+		row[i].HasStringQuote = parser.fieldIsQuoted[i]
+		preIdx = idx
+	}
+
+	return row, nil
+}
+
+func (parser *CSVParser) unescapeString(content string, quoted bool) (unescaped string, isNull bool, err error) {
+	unescaped = content
+	// Convert the input from another charset to utf8mb4 before we return the string.
+	if parser.escFlavor == escapeFlavorMySQLWithNull && unescaped == parser.escapedBy+`N` {
+		return content, true, nil
+	}
+	if parser.cfg.FieldsEnclosedBy != "" && !quoted && unescaped == "NULL" {
+		return content, true, nil
+	}
+	if len(parser.escapedBy) > 0 {
+		unescaped = unescape(unescaped, "", parser.escFlavor, parser.escapedBy[0], parser.unescapeRegexp)
+	}
+	if !(len(parser.quote) > 0 && parser.quotedNullIsText && quoted) {
+		// this branch represents "quote is not configured" or "quoted null is null" or "this field has no quote"
+		// we check null for them
+		isNull = !parser.cfg.NotNull &&
+			slices.Contains(parser.cfg.Null, unescaped)
+		// avoid \\N becomes NULL
+		if parser.escFlavor == escapeFlavorMySQLWithNull && unescaped == parser.escapedBy+`N` {
+			isNull = false
+		}
+	}
+	return
+}
+
+// csvToken is a type representing either a normal byte or some CSV-specific
+// tokens such as the separator (comma), delimiter (quote) and terminator (new
+// line).
+type csvToken int16
+
+const (
+	// csvTokenAnyUnquoted is a placeholder to represent any unquoted character.
+	csvTokenAnyUnquoted csvToken = 0
+	// csvTokenEscaped is a mask indicating an escaped character.
+	// The actual token is represented like `csvTokenEscaped | 'n'`.
+	csvTokenEscaped csvToken = 0x100
+	// csvTokenComma is the CSV separator token.
+	csvTokenComma csvToken = 0x200
+	// csvTokenNewLine is the CSV terminator token.
+	csvTokenNewLine csvToken = 0x400
+	// csvTokenDelimiter is the CSV delimiter token.
+	csvTokenDelimiter csvToken = 0x800
+)
+
+// newlineByte is the record/line terminator the line counter looks for.
+var newlineByte = []byte{'\n'}
+
+func (parser *CSVParser) readByte() (byte, error) {
+	if len(parser.buf) == 0 {
+		if err := parser.readBlock(); err != nil {
+			return 0, err
+		}
+	}
+	if len(parser.buf) == 0 {
+		return 0, io.EOF
+	}
+	b := parser.buf[0]
+	parser.buf = parser.buf[1:]
+	parser.pos++
+	if b == '\n' {
+		parser.lineNo++
+	}
+	return b, nil
+}
+
+func (parser *CSVParser) peekBytes(cnt int) ([]byte, error) {
+	if len(parser.buf) < cnt {
+		if err := parser.readBlock(); err != nil {
+			return nil, err
+		}
+	}
+	if len(parser.buf) == 0 {
+		return nil, io.EOF
+	}
+	if len(parser.buf) < cnt {
+		cnt = len(parser.buf)
+	}
+	return parser.buf[:cnt], nil
+}
+
+func (parser *CSVParser) skipBytes(n int) {
+	parser.lineNo += int64(bytes.Count(parser.buf[:n], newlineByte))
+	parser.buf = parser.buf[n:]
+	parser.pos += int64(n)
+}
+
+// tryPeekExact peeks the bytes ahead, and if it matches `content` exactly will
+// return (true, false, nil). If meet EOF it will return (false, true, nil).
+// For other errors it will return (false, false, err).
+func (parser *CSVParser) tryPeekExact(content []byte) (matched bool, eof bool, err error) {
+	if len(content) == 0 {
+		return true, false, nil
+	}
+	bs, err := parser.peekBytes(len(content))
+	if err == nil {
+		if bytes.Equal(bs, content) {
+			return true, false, nil
+		}
+	} else if err == io.EOF {
+		return false, true, nil
+	}
+	return false, false, err
+}
+
+func (parser *CSVParser) tryPeekNewLine(content []byte) (matched bool, eof bool, err error) {
+	if len(content) == 0 {
+		return true, false, nil
+	}
+	bs, err := parser.peekBytes(len(content))
+	if err == nil {
+		if bytes.Equal(bs, content) {
+			return true, false, nil
+		}
+		if bytes.Equal(content, []byte{'\n'}) {
+			if bytes.Equal(bs, []byte{'\r'}) {
+				parser.skipBytes(1)
+				return true, false, nil
+			}
+		}
+	} else if err == io.EOF {
+		return false, true, nil
+	}
+	return false, false, err
+}
+
+// tryReadExact peeks the bytes ahead, and if it matches `content` exactly will
+// consume it (advance the cursor) and return `true`.
+func (parser *CSVParser) tryReadExact(content []byte) (bool, error) {
+	matched, _, err := parser.tryPeekExact(content)
+	if matched {
+		parser.skipBytes(len(content))
+	}
+	return matched, err
+}
+
+func (parser *CSVParser) tryReadNewLine(b byte) (bool, error) {
+	if len(parser.newLine) == 0 || bytes.Equal(parser.newLine, []byte{'\n'}) {
+		return b == '\r' || b == '\n', nil
+	}
+
+	if b != parser.newLine[0] {
+		return false, nil
+	}
+	return parser.tryReadExact(parser.newLine[1:])
+}
+
+func (parser *CSVParser) tryReadOpenDelimiter(b byte) (bool, error) {
+	if len(parser.quote) == 0 || parser.quote[0] != b {
+		return false, nil
+	}
+	return parser.tryReadExact(parser.quote[1:])
+}
+
+// tryReadCloseDelimiter is currently equivalent to tryReadOpenDelimiter until
+// we support asymmetric delimiters.
+func (parser *CSVParser) tryReadCloseDelimiter(b byte) (bool, error) {
+	if parser.quote[0] != b {
+		return false, nil
+	}
+	return parser.tryReadExact(parser.quote[1:])
+}
+
+func (parser *CSVParser) tryReadComma(b byte) (bool, error) {
+	if parser.comma[0] != b {
+		return false, nil
+	}
+	return parser.tryReadExact(parser.comma[1:])
+}
+
+func (parser *CSVParser) tryReadEscaped(bs byte) (bool, byte, error) {
+	if parser.escapedBy == "" {
+		return false, 0, nil
+	}
+	if bs != parser.escapedBy[0] || parser.escFlavor == escapeFlavorNone {
+		return false, 0, nil
+	}
+	b, err := parser.readByte()
+	return true, b, parser.replaceEOF(err, errDanglingBackslash)
+}
+
+// readQuoteToken reads a token inside quoted fields.
+func (parser *CSVParser) readQuotedToken(b byte) (csvToken, error) {
+	if ok, err := parser.tryReadCloseDelimiter(b); ok || err != nil {
+		return csvTokenDelimiter, err
+	}
+	if ok, eb, err := parser.tryReadEscaped(b); ok || err != nil {
+		return csvTokenEscaped | csvToken(eb), err
+	}
+	return csvToken(b), nil
+}
+
+// readUnquoteToken reads a token outside quoted fields.
+func (parser *CSVParser) readUnquoteToken(b byte) (csvToken, error) {
+	if ok, err := parser.tryReadNewLine(b); ok || err != nil {
+		return csvTokenNewLine, err
+	}
+	if ok, err := parser.tryReadComma(b); ok || err != nil {
+		return csvTokenComma, err
+	}
+	if ok, err := parser.tryReadOpenDelimiter(b); ok || err != nil {
+		return csvTokenDelimiter, err
+	}
+	if ok, eb, err := parser.tryReadEscaped(b); ok || err != nil {
+		return csvTokenEscaped | csvToken(eb), err
+	}
+	return csvToken(b), nil
+}
+
+func (parser *CSVParser) appendCSVTokenToRecordBuffer(token csvToken) {
+	if token&csvTokenEscaped != 0 {
+		parser.recordBuffer = append(parser.recordBuffer, parser.escapedBy[0])
+	}
+	parser.recordBuffer = append(parser.recordBuffer, byte(token))
+}
+
+// readUntil reads the buffer until any character from the `chars` set is found.
+// that character is excluded from the final buffer.
+func (parser *CSVParser) readUntil(chars *byteSet) ([]byte, byte, error) {
+	index := IndexAnyByte(parser.buf, chars)
+	if index >= 0 {
+		ret := parser.buf[:index]
+		parser.lineNo += int64(bytes.Count(ret, newlineByte))
+		parser.buf = parser.buf[index:]
+		parser.pos += int64(index)
+		return ret, parser.buf[0], nil
+	}
+
+	// not found in parser.buf, need allocate and loop.
+	var buf []byte
+	for {
+		// Every byte of parser.buf is drained into buf here, so this is where
+		// its newlines are consumed. Counting only the final block's prefix
+		// below would lose the newlines of every block drained before it,
+		// which is what a quoted field spanning more than one read block does.
+		parser.lineNo += int64(bytes.Count(parser.buf, newlineByte))
+		buf = append(buf, parser.buf...)
+		if len(buf) > config.LargestEntryLimit {
+			return buf, 0, moerr.NewInternalErrorNoCtx("size of row cannot exceed the max value of txn-entry-size-limit")
+		}
+		parser.buf = nil
+		if err := parser.readBlock(); err != nil || len(parser.buf) == 0 {
+			if err == nil {
+				err = io.EOF
+			}
+			parser.pos += int64(len(buf))
+			return buf, 0, err
+		}
+		index := IndexAnyByte(parser.buf, chars)
+		if index >= 0 {
+			parser.lineNo += int64(bytes.Count(parser.buf[:index], newlineByte))
+			buf = append(buf, parser.buf[:index]...)
+			parser.buf = parser.buf[index:]
+			parser.pos += int64(len(buf))
+			return buf, parser.buf[0], nil
+		}
+	}
+}
+
+func (parser *CSVParser) readRecord() error {
+	parser.recordStartLine = parser.lineNo
+	parser.recordBuffer = parser.recordBuffer[:0]
+	parser.fieldIndexes = parser.fieldIndexes[:0]
+	parser.fieldIsQuoted = parser.fieldIsQuoted[:0]
+
+	isEmptyLine := true
+	whitespaceLine := true
+	foundStartingByThisLine := false
+	prevToken := csvTokenNewLine
+	fieldIsQuoted := false
+	var firstToken csvToken
+
+outside:
+	for {
+		// Comment lines are recognized by the RAW prefix of the line, before any
+		// unquoting — so a quoted value such as "#x" (whose raw prefix is the
+		// enclosure char) is data, while an unquoted line beginning with the
+		// comment marker is skipped. This is the first check on each fresh line
+		// (prevToken==newline, nothing accumulated yet, startingBy not matched),
+		// and it loops to skip consecutive comment lines. An empty marker
+		// (the default) disables comments entirely.
+		if len(parser.comment) > 0 && prevToken == csvTokenNewLine &&
+			len(parser.recordBuffer) == 0 && !foundStartingByThisLine {
+			if bs, perr := parser.peekBytes(len(parser.comment)); perr == nil && bytes.Equal(bs, parser.comment) {
+				if _, _, rerr := parser.readUntilTerminator(); rerr != nil && rerr != io.EOF {
+					return rerr
+				}
+				continue
+			}
+		}
+
+		// we should drop
+		// 1. the whole line if it does not contain startingBy
+		// 2. any character before startingBy
+		// since we have checked startingBy does not contain terminator, we can
+		// split at terminator to check the substring contains startingBy. Even
+		// if the terminator is inside a quoted field which means it's not the
+		// end of a line, the substring can still be dropped by rule 2.
+		if len(parser.startingBy) > 0 && !foundStartingByThisLine {
+			oldPos := parser.pos
+			oldLineNo := parser.lineNo
+			content, _, err := parser.readUntilTerminator()
+			if err != nil {
+				if len(content) == 0 {
+					return err
+				}
+				// if we reached EOF, we should still check the content contains
+				// startingBy and try to put back and parse it.
+			}
+			idx := bytes.Index(content, parser.startingBy)
+			if idx == -1 {
+				continue
+			}
+			foundStartingByThisLine = true
+			// The lookahead consumed -- and counted -- a whole line. Only the
+			// prefix up to and including startingBy stays consumed; the rest is
+			// pushed back and parsed again, so the line counter has to rewind
+			// with pos or that newline is counted twice.
+			consumed := content[:idx+len(parser.startingBy)]
+			content = content[idx+len(parser.startingBy):]
+			parser.buf = append(content, parser.buf...)
+			parser.pos = oldPos + int64(idx+len(parser.startingBy))
+			parser.lineNo = oldLineNo + int64(bytes.Count(consumed, newlineByte))
+		}
+
+		content, firstByte, err := parser.readUntil(&parser.unquoteByteSet)
+
+		if len(content) > 0 {
+			isEmptyLine = false
+			if prevToken == csvTokenDelimiter {
+				return errUnexpectedQuoteField
+			}
+			parser.recordBuffer = append(parser.recordBuffer, content...)
+			prevToken = csvTokenAnyUnquoted
+		}
+
+		if err != nil {
+			if isEmptyLine || err != io.EOF {
+				return err
+			}
+			// treat EOF as the same as trailing \n.
+			firstToken = csvTokenNewLine
+		} else {
+			parser.skipBytes(1)
+			firstToken, err = parser.readUnquoteToken(firstByte)
+			if err != nil {
+				return err
+			}
+		}
+
+		switch firstToken {
+		case csvTokenComma:
+			whitespaceLine = false
+			parser.fieldIndexes = append(parser.fieldIndexes, len(parser.recordBuffer))
+			parser.fieldIsQuoted = append(parser.fieldIsQuoted, fieldIsQuoted)
+			fieldIsQuoted = false
+		case csvTokenDelimiter:
+			if prevToken != csvTokenComma && prevToken != csvTokenNewLine {
+				if parser.unescapedQuote {
+					whitespaceLine = false
+					parser.recordBuffer = append(parser.recordBuffer, parser.quote...)
+					continue
+				}
+				return errUnexpectedQuoteField
+			}
+			if err = parser.readQuotedField(); err != nil {
+				return err
+			}
+			fieldIsQuoted = true
+			whitespaceLine = false
+		case csvTokenNewLine:
+			foundStartingByThisLine = false
+			// new line = end of field (ignore empty lines)
+			prevToken = firstToken
+			if !parser.allowEmptyLine {
+				if isEmptyLine {
+					// The record has not started yet: it begins at the first
+					// line with content, not where the scan started.
+					parser.recordStartLine = parser.lineNo
+					continue
+				}
+				// skip lines only contain whitespaces
+				if err == nil && whitespaceLine && len(bytes.TrimSpace(parser.recordBuffer)) == 0 {
+					parser.recordBuffer = parser.recordBuffer[:0]
+					parser.recordStartLine = parser.lineNo
+					continue
+				}
+			}
+			if bytes.Equal(parser.newLine, []byte{'\n'}) {
+				if n := len(parser.recordBuffer); n > 1 && parser.recordBuffer[n-1] == '\r' {
+					parser.recordBuffer = parser.recordBuffer[:n-1]
+				}
+			}
+			parser.fieldIndexes = append(parser.fieldIndexes, len(parser.recordBuffer))
+			parser.fieldIsQuoted = append(parser.fieldIsQuoted, fieldIsQuoted)
+			// the loop is end, no need to reset fieldIsQuoted
+			break outside
+		default:
+			if prevToken == csvTokenDelimiter {
+				return errUnexpectedQuoteField
+			}
+			parser.appendCSVTokenToRecordBuffer(firstToken)
+		}
+		prevToken = firstToken
+		isEmptyLine = false
+	}
+	return nil
+}
+
+func (parser *CSVParser) readQuotedField() error {
+	for {
+		prevPos := parser.pos
+		content, terminator, err := parser.readUntil(&parser.quoteByteSet)
+		if err != nil {
+			if err == io.EOF {
+				// return the position of quote to the caller.
+				// because we return an error here, the parser won't
+				// use the `pos` again, so it's safe to modify it here.
+				parser.pos = prevPos - 1
+				// set buf to parser.buf in order to print err log
+				parser.buf = content
+				err = parser.replaceEOF(err, errUnterminatedQuotedField)
+			}
+			return err
+		}
+		parser.recordBuffer = append(parser.recordBuffer, content...)
+		parser.skipBytes(1)
+
+		token, err := parser.readQuotedToken(terminator)
+		if err != nil {
+			return err
+		}
+
+		switch token {
+		case csvTokenDelimiter:
+			// encountered '"' -> continue if we're seeing '""'.
+			doubledDelimiter, err := parser.tryReadExact(parser.quote)
+			if err != nil {
+				return err
+			}
+			if doubledDelimiter {
+				// consume the double quotation mark and continue
+				parser.recordBuffer = append(parser.recordBuffer, parser.quote...)
+			} else if parser.unescapedQuote {
+				// allow unescaped quote inside quoted field, so we only finish
+				// reading the field when we see a delimiter + comma/newline.
+				comma, _, err2 := parser.tryPeekExact(parser.comma)
+				if comma || err2 != nil {
+					return err2
+				}
+
+				newline, eof, err2 := parser.tryPeekNewLine(parser.newLine)
+				if eof || newline {
+					return nil
+				}
+
+				if err2 != nil {
+					return err2
+				}
+				parser.recordBuffer = append(parser.recordBuffer, parser.quote...)
+			} else {
+				// the field is completed, exit.
+				return nil
+			}
+		default:
+			parser.appendCSVTokenToRecordBuffer(token)
+		}
+	}
+}
+
+func (parser *CSVParser) replaceEOF(err error, replaced error) error {
+	if err == nil || err != io.EOF {
+		return err
+	}
+	return replaced
+}
+
+// readColumns reads the columns of this CSV file.
+func (parser *CSVParser) readColumns() error {
+	if err := parser.readRecord(); err != nil {
+		return err
+	}
+
+	if !parser.cfg.HeaderSchemaMatch {
+		return nil
+	}
+
+	parser.columns = parser.columns[:0]
+	if cap(parser.columns) < len(parser.fieldIndexes) {
+		parser.columns = make([]string, 0, len(parser.fieldIndexes))
+	}
+	str := string(parser.recordBuffer) // Convert to string once to batch allocations
+	var preIdx int
+	for i, idx := range parser.fieldIndexes {
+		colNameStr, _, err := parser.unescapeString(str[preIdx:idx], parser.fieldIsQuoted[i])
+		if err != nil {
+			return err
+		}
+		parser.columns = append(parser.columns, strings.ToLower(colNameStr))
+		preIdx = idx
+	}
+	return nil
+}
+
+// readUntilTerminator seeks the file until the terminator token is found, and
+// returns
+// - the content with terminator, or the content read before meet error
+// - the file offset beyond the terminator, or the offset when meet error
+// - error
+// Note that the terminator string pattern may be the content of a field, which
+// means it's inside quotes. Caller should make sure to handle this case.
+func (parser *CSVParser) readUntilTerminator() ([]byte, int64, error) {
+	var ret []byte
+	for {
+		content, firstByte, err := parser.readUntil(&parser.newLineByteSet)
+		ret = append(ret, content...)
+		if err != nil {
+			return ret, parser.pos, err
+		}
+		parser.skipBytes(1)
+		ret = append(ret, firstByte)
+		if ok, err := parser.tryReadNewLine(firstByte); ok || err != nil {
+			if len(parser.newLine) >= 1 {
+				ret = append(ret, parser.newLine[1:]...)
+			}
+			return ret, parser.pos, err
+		}
+	}
+}
+
+func (parser *CSVParser) readBlock() error {
+	n, err := io.ReadFull(parser.reader, parser.blockBuf)
+
+	switch {
+	case errors.Is(err, io.ErrUnexpectedEOF), err == io.EOF:
+		parser.isLastChunk = true
+		fallthrough
+	case err == nil:
+
+		blockData := parser.blockBuf[:n]
+		if parser.pos == 0 {
+			bomCleanedData := bom.Clean(blockData)
+			parser.pos += int64(n - len(bomCleanedData))
+			blockData = bomCleanedData
+		}
+		if len(parser.buf) == 0 {
+			// `parser.buf` reference to parser.blockBuf, avoid copy from parser.blockBuf to parser.appendBuf
+			parser.buf = blockData
+		} else {
+			// `parser.buf` reference to `appendBuf.Bytes`, so should use remainBuf to
+			// hold the `parser.buf` rest data to prevent slice overlap
+			parser.remainBuf.Reset()
+			parser.remainBuf.Write(parser.buf)
+			parser.appendBuf.Reset()
+			parser.appendBuf.Write(parser.remainBuf.Bytes())
+			parser.appendBuf.Write(blockData)
+			parser.buf = parser.appendBuf.Bytes()
+		}
+
+		return nil
+	default:
+		return err
+	}
+}
+
+func (parser *CSVParser) Columns() []string {
+	return parser.columns
+}
+
+func (parser *CSVParser) SetColumns(columns []string) {
+	parser.columns = columns
+}
+
+func unescape(
+	input string,
+	delim string,
+	escFlavor escapeFlavor,
+	escChar byte,
+	unescapeRegexp *regexp.Regexp,
+) string {
+	if len(delim) > 0 {
+		delim2 := delim + delim
+		if strings.Contains(input, delim2) {
+			input = strings.ReplaceAll(input, delim2, delim)
+		}
+	}
+	if escFlavor != escapeFlavorNone && strings.IndexByte(input, escChar) != -1 {
+		input = unescapeRegexp.ReplaceAllStringFunc(input, func(substr string) string {
+			switch substr[1] {
+			case '0':
+				return "\x00"
+			case 'b':
+				return "\b"
+			case 'n':
+				return "\n"
+			case 'r':
+				return "\r"
+			case 't':
+				return "\t"
+			case 'Z':
+				return "\x1a"
+			default:
+				return substr[1:]
+			}
+		})
+	}
+	return input
+}
+
+// Copyright 2009 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+// Package bytes implements functions for the manipulation of byte slices.
+// It is analogous to the facilities of the strings package.
+
+// this part is copy from `bytes/bytes.go`
+
+// byteSet is a 32-byte value, where each bit represents the presence of a
+// given byte value in the set.
+type byteSet [8]uint32
+
+// makeByteSet creates a set of byte value.
+func makeByteSet(chars []byte) (as byteSet) {
+	for i := 0; i < len(chars); i++ {
+		c := chars[i]
+		as[c>>5] |= 1 << uint(c&31)
+	}
+	return as
+}
+
+// contains reports whether c is inside the set.
+func (as *byteSet) contains(c byte) bool {
+	return (as[c>>5] & (1 << uint(c&31))) != 0
+}
+
+// IndexAnyByte returns the byte index of the first occurrence in s of any in the byte
+// points in chars. It returns -1 if  there is no code point in common.
+func IndexAnyByte(s []byte, as *byteSet) int {
+	for i, c := range s {
+		if as.contains(c) {
+			return i
+		}
+	}
+	return -1
+}

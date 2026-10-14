@@ -1,0 +1,107 @@
+{
+  "prefix": "databases/complete/integration-7c1de9c8-bd3f-4cf0-8e05-2f0797aeba21",
+  "checks": [
+    {
+      "name": "native SQL: DDL, INSERT, JOIN, window, subquery",
+      "detail": [
+        [
+          [
+            3,
+            "150.50"
+          ]
+        ],
+        [
+          [
+            "ada",
+            "50.50"
+          ],
+          [
+            "grace",
+            "100.00"
+          ]
+        ],
+        [
+          [
+            1,
+            3
+          ],
+          [
+            2,
+            2
+          ],
+          [
+            3,
+            1
+          ]
+        ],
+        [
+          [
+            "grace"
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "native constraint rejection",
+      "detail": "(1062, \"Duplicate entry 'ada@demo' for key 'email'\")"
+    },
+    {
+      "name": "native constraint rejection",
+      "detail": "(20101, 'internal error: Cannot add or update a child row: a foreign key constraint fails')"
+    },
+    {
+      "name": "writer transaction rollback",
+      "detail": null
+    },
+    {
+      "name": "independent reader restores all native SQL from bucket",
+      "detail": "60b5f3d4-eb61-41f6-87cd-2fbc0387b9b2"
+    },
+    {
+      "name": "reader write rejected",
+      "detail": "(20301, 'invalid input: bucket reader is read-only')"
+    },
+    {
+      "name": "reader write rejected",
+      "detail": "(20301, 'invalid input: bucket reader is read-only')"
+    },
+    {
+      "name": "reader transaction pins generation across writer commit",
+      "detail": null
+    },
+    {
+      "name": "reader automatically sees committed update/delete/insert",
+      "detail": null
+    },
+    {
+      "name": "explicit old snapshot remains readable",
+      "detail": null
+    },
+    {
+      "name": "second live writer rejected by bucket CAS lease",
+      "detail": null
+    },
+    {
+      "name": "native auto-increment catalog survives bucket-only recovery",
+      "detail": null
+    },
+    {
+      "name": "SIGKILL, empty local directory, bucket-only writer recovery and continued writes",
+      "detail": null
+    },
+    {
+      "name": "fresh reader sees recovered writer commit",
+      "detail": null
+    }
+  ],
+  "timings_seconds": {
+    "writer-1": 7.785,
+    "reader-2": 3.841,
+    "reader-refresh": 0.154,
+    "reader-3": 4.434,
+    "writer-5": 6.702,
+    "reader-6": 5.062
+  },
+  "killed_writer_pid": 234086,
+  "status": "passed"
+}

@@ -1,0 +1,297 @@
+// Copyright 2022 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package plan
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+
+	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/function"
+	"github.com/matrixorigin/matrixone/pkg/util/trace"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/options"
+	"github.com/matrixorigin/matrixone/pkg/vm/process"
+)
+
+//this file is duplicate with colexec/external/external.go , to avoid import cycle
+
+func filterFileList(ctx context.Context, node *plan.Node, proc *process.Process, fileList []string, fileSize []int64) ([]string, []int64, []*plan.Expr, error) {
+	return filterByAccountAndFilename(ctx, node, proc, fileList, fileSize)
+}
+
+func isFileLevelColumn(node *plan.Node, col *plan.ColRef) bool {
+	if node == nil || node.TableDef == nil || node.ExternScan == nil || col == nil {
+		return false
+	}
+
+	colPos := int(col.ColPos)
+	if colPos < 0 || colPos >= len(node.TableDef.Cols) || colPos != len(node.TableDef.Cols)-1 {
+		return false
+	}
+	if node.TableDef.Cols[colPos].Name != catalog.ExternalFilePath {
+		return false
+	}
+	return node.TableDef.Cols[colPos].ColId == catalog.ExternalFilePathColId
+}
+
+func isSafeFileLevelFunction(ref *plan.ObjectRef) bool {
+	if ref == nil {
+		return false
+	}
+	overload, exists := function.GetFunctionByIdWithoutError(ref.Obj)
+	if !exists || overload.IsRealTimeRelated() {
+		return false
+	}
+	if !overload.CannotFold() {
+		return true
+	}
+
+	// mo_log_date is marked volatile to prevent ordinary constant folding, but
+	// it is a deterministic transform of __mo_filepath and is the established
+	// file-pruning primitive. Other volatile functions must stay at row level.
+	functionID, _ := function.DecodeOverloadID(ref.Obj)
+	return functionID == function.MO_LOG_DATE
+}
+
+func classifyFileLevelColumns(node *plan.Node, expr *plan.Expr) (hasFileLevelColumn, hasUnsupportedColumn bool) {
+	if expr == nil {
+		return false, false
+	}
+
+	switch typedExpr := expr.Expr.(type) {
+	case *plan.Expr_Col:
+		if typedExpr.Col == nil {
+			return false, true
+		}
+		if isFileLevelColumn(node, typedExpr.Col) {
+			return true, false
+		}
+		return false, true
+	case *plan.Expr_F:
+		if typedExpr.F == nil || typedExpr.F.Func == nil {
+			return false, true
+		}
+		if !isSafeFileLevelFunction(typedExpr.F.Func) {
+			return false, true
+		}
+		for _, arg := range typedExpr.F.Args {
+			hasFileLevel, hasUnsupported := classifyFileLevelColumns(node, arg)
+			hasFileLevelColumn = hasFileLevelColumn || hasFileLevel
+			hasUnsupportedColumn = hasUnsupportedColumn || hasUnsupported
+		}
+		return hasFileLevelColumn, hasUnsupportedColumn
+	case *plan.Expr_List:
+		if typedExpr.List == nil {
+			return false, false
+		}
+		for _, item := range typedExpr.List.List {
+			hasFileLevel, hasUnsupported := classifyFileLevelColumns(node, item)
+			hasFileLevelColumn = hasFileLevelColumn || hasFileLevel
+			hasUnsupportedColumn = hasUnsupportedColumn || hasUnsupported
+		}
+		return hasFileLevelColumn, hasUnsupportedColumn
+	case *plan.Expr_Lit, *plan.Expr_P, *plan.Expr_V, *plan.Expr_T,
+		*plan.Expr_Max, *plan.Expr_Vec, *plan.Expr_Fold:
+		return false, false
+	default:
+		return false, true
+	}
+}
+
+func isFileLevelFilter(node *plan.Node, expr *plan.Expr) bool {
+	if expr == nil {
+		return false
+	}
+
+	functionExpr, ok := expr.Expr.(*plan.Expr_F)
+	if !ok || functionExpr.F == nil || functionExpr.F.Func == nil {
+		return false
+	}
+	if !isSafeFileLevelFunction(functionExpr.F.Func) {
+		return false
+	}
+	if functionExpr.F.Func.ObjName == "or" {
+		if len(functionExpr.F.Args) == 0 {
+			return false
+		}
+		for _, arg := range functionExpr.F.Args {
+			if !isFileLevelFilter(node, arg) {
+				return false
+			}
+		}
+		return true
+	}
+
+	hasFileLevelColumn, hasUnsupportedColumn := classifyFileLevelColumns(node, expr)
+	return hasFileLevelColumn && !hasUnsupportedColumn
+}
+
+func filterByAccountAndFilename(ctx context.Context, node *plan.Node, proc *process.Process, fileList []string, fileSize []int64) ([]string, []int64, []*plan.Expr, error) {
+	_, span := trace.Start(ctx, "filterByAccountAndFilename")
+	defer span.End()
+	filterList := make([]*plan.Expr, 0)
+	filterList2 := make([]*plan.Expr, 0)
+	for i := 0; i < len(node.FilterList); i++ {
+		if isFileLevelFilter(node, node.FilterList[i]) {
+			filterList = append(filterList, node.FilterList[i])
+		} else {
+			filterList2 = append(filterList2, node.FilterList[i])
+		}
+	}
+	if len(filterList) == 0 {
+		return fileList, fileSize, filterList2, nil
+	}
+	bat := makeFilepathBatch(node, proc, fileList)
+	defer bat.Clean(proc.Mp())
+	filter := colexec.RewriteFilterExprList(filterList)
+
+	vec, free, err := colexec.GetReadonlyResultFromExpression(proc, filter, []*batch.Batch{bat})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer free()
+
+	fileListTmp := make([]string, 0)
+	fileSizeTmp := make([]int64, 0)
+	for i := 0; i < len(fileList); i++ {
+		valuePos := i
+		if vec.IsConst() {
+			valuePos = 0
+		}
+		if !vec.GetNulls().Contains(uint64(valuePos)) && vector.GetFixedAtNoTypeCheck[bool](vec, i) {
+			fileListTmp = append(fileListTmp, fileList[i])
+			fileSizeTmp = append(fileSizeTmp, fileSize[i])
+		}
+	}
+	return fileListTmp, fileSizeTmp, filterList2, nil
+}
+
+func makeFilepathBatch(node *plan.Node, proc *process.Process, fileList []string) *batch.Batch {
+	num := len(node.TableDef.Cols)
+	bat := &batch.Batch{
+		Attrs: make([]string, num),
+		Vecs:  make([]*vector.Vector, num),
+	}
+	for i := 0; i < num; i++ {
+		bat.Attrs[i] = node.TableDef.Cols[i].Name
+		if i == num-1 && bat.Attrs[i] == catalog.ExternalFilePath {
+			typ := types.T_varchar.ToType()
+			vec, _ := proc.AllocVectorOfRows(typ, len(fileList), nil)
+			//vec.SetOriginal(false)
+			for j := 0; j < len(fileList); j++ {
+				vector.SetStringAt(vec, j, fileList[j], proc.Mp())
+			}
+			bat.Vecs[i] = vec
+		}
+	}
+	bat.SetRowCount(len(fileList))
+	return bat
+}
+
+func getExternalStats(node *plan.Node, builder *QueryBuilder) *Stats {
+	externScan := node.ExternScan
+	if externScan != nil && externScan.LoadType == tree.INLINE {
+		totolSize := len(externScan.Data)
+		lineSize := float64(0.0)
+		if externScan.Format == tree.CSV {
+			lineSize = inlineCSVRowsize(externScan.Data, "\n")
+		}
+
+		if externScan.Format == tree.JSONLINE {
+			lineSize = GetRowSizeFromTableDef(node.GetTableDef(), true) * 0.8
+		}
+
+		if lineSize > 0 {
+			cost := float64(totolSize) / lineSize
+			return &plan.Stats{
+				Outcnt:      cost,
+				Cost:        cost,
+				Rowsize:     lineSize,
+				Selectivity: 1,
+				TableCnt:    cost,
+				BlockNum:    int32(cost / float64(options.DefaultBlockMaxRows)),
+			}
+		}
+	}
+
+	param := &tree.ExternParam{}
+	err := json.Unmarshal([]byte(node.TableDef.Createsql), param)
+	if err != nil || param.Local {
+		return DefaultHugeStats()
+	}
+
+	if param.HivePartitioning {
+		return DefaultHugeStats()
+	}
+
+	if param.ScanType == tree.S3 {
+		if err = InitS3Param(param); err != nil {
+			return DefaultHugeStats()
+		}
+	} else {
+		if err = InitInfileOrStageParam(param, builder.compCtx.GetProcess()); err != nil {
+			return DefaultHugeStats()
+		}
+	}
+
+	param.FileService = builder.compCtx.GetProcess().GetFileService()
+	param.Ctx = builder.compCtx.GetProcess().Ctx
+	_, spanReadDir := trace.Start(param.Ctx, "ReCalcNodeStats.ReadDir")
+	fileList, fileSize, err := ReadDir(param)
+	spanReadDir.End()
+	if err != nil {
+		return DefaultHugeStats()
+	}
+	fileList, fileSize, _, err = filterFileList(param.Ctx, node, builder.compCtx.GetProcess(), fileList, fileSize)
+	if err != nil {
+		return DefaultHugeStats()
+	}
+	if node.ExternScan.Type == int32(plan.ExternType_LOAD) && len(fileList) == 0 {
+		// all files filtered, return a default small stats
+		return DefaultStats()
+	}
+
+	var cost float64
+	for i := range fileSize {
+		cost += float64(fileSize[i])
+	}
+
+	//special handle for query result
+	if strings.HasPrefix(param.Filepath, "SHARED:/query_result/") {
+		return DefaultStats()
+	}
+
+	size := readExternalFirstLineSize(param, totalLoadFileSize(fileSize), 0, param.Ctx)
+	if size == 0 {
+		return DefaultHugeStats()
+	}
+	cost = cost / float64(size)
+
+	return &plan.Stats{
+		Outcnt:      cost,
+		Cost:        cost,
+		Rowsize:     float64(size),
+		Selectivity: 1,
+		TableCnt:    cost,
+		BlockNum:    int32(cost / float64(options.DefaultBlockMaxRows)),
+	}
+}

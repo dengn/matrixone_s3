@@ -1,0 +1,999 @@
+// Copyright 2023 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package backup
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path"
+	runtime2 "runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/gc/v3"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/runtime"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/function/ctl"
+	"github.com/matrixorigin/matrixone/pkg/util/executor"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/checkpoint"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logtail"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tasks"
+)
+
+const (
+	// Backup protection update interval
+	backupProtectionUpdateInterval = 5 * time.Minute
+	// mo_ctl command prefix for backup protection
+	backupProtectionCmdPrefix = "add_checker.backup."
+	backupProtectionRemoveCmd = "remove_checker.backup."
+)
+
+func getFileNames(ctx context.Context, retBytes [][][]byte) ([]string, error) {
+	var err error
+	cr := ctl.Result{}
+	err = json.Unmarshal(retBytes[0][0], &cr)
+	if err != nil {
+		return nil, err
+	}
+	rsSlice, ok := cr.Data.([]interface{})
+	if !ok {
+		return nil, moerr.NewInternalError(ctx, "invalid ctl result")
+	}
+	var fileName []string
+	for _, rs := range rsSlice {
+		str, ok := rs.(string)
+		if !ok {
+			return nil, moerr.NewInternalError(ctx, "invalid ctl string")
+		}
+
+		for _, x := range strings.Split(str, ";") {
+			if len(x) == 0 {
+				continue
+			}
+			fileName = append(fileName, x)
+		}
+	}
+	return fileName, err
+}
+
+func BackupData(
+	ctx context.Context,
+	sid string,
+	srcFs, dstFs fileservice.FileService,
+	dir string,
+	config *Config,
+	globalIndex *GlobalFileIndex,
+) error {
+	v, ok := runtime.ServiceRuntime(sid).GetGlobalVariables(runtime.InternalSQLExecutor)
+	if !ok {
+		return moerr.NewNotSupported(ctx, "no implement sqlExecutor")
+	}
+	exec := v.(executor.SQLExecutor)
+	opts := executor.Options{}
+	sql := "select mo_ctl('dn','Backup','')"
+	res, err := exec.Exec(ctx, sql, opts)
+	if err != nil {
+		return err
+	}
+
+	var retByts [][][]byte
+	res.ReadRows(func(_ int, cols []*vector.Vector) bool {
+		retByts = append(retByts, executor.GetBytesRows(cols[0]))
+		return true
+	})
+	res.Close()
+
+	fileName, err := getFileNames(ctx, retByts)
+	if err != nil {
+		return err
+	}
+
+	// Setup backup protection manager
+	//exec, opts = getSQLExecutor(sid)
+	protectionMgr := newBackupProtectionManager(ctx, exec, opts)
+	defer protectionMgr.cleanup()
+
+	count := config.Parallelism
+	return execBackup(ctx, sid, srcFs, dstFs, fileName, int(count), config.BackupTs, config.BackupType, nil, protectionMgr, globalIndex)
+}
+
+func getParallelCount(count int) int {
+	if count > 0 && count < 512 {
+		return count
+	}
+	cupNum := runtime2.NumCPU()
+	if cupNum < 8 {
+		return 50
+	} else if cupNum < 16 {
+		return 80
+	} else if cupNum < 32 {
+		return 128
+	} else if cupNum < 64 {
+		return 256
+	}
+	return 512
+}
+
+// parallelCopyData copy data from srcFs to dstFs in parallel
+func parallelCopyData(ctx context.Context, srcFs, dstFs fileservice.FileService,
+	files map[string]*objectio.BackupObject,
+	parallelCount int,
+	gcFileMap map[string]string,
+) ([]*taeFile, error) {
+	var copyCount, copySize int64
+	var printMutex, fileMutex sync.Mutex
+	stopPrint := false
+	defer func() {
+		printMutex.Lock()
+		if !stopPrint {
+			stopPrint = true
+		}
+		printMutex.Unlock()
+	}()
+	// record files
+	taeFileList := make([]*taeFile, 0, len(files))
+	jobScheduler := tasks.NewParallelJobScheduler(parallelCount)
+	defer jobScheduler.Stop()
+	copyCtx, cancelCopy := context.WithCancelCause(ctx)
+	defer cancelCopy(nil)
+	jobDone := make(chan struct{}, len(files))
+	go func() {
+		for {
+			printMutex.Lock()
+			if stopPrint {
+				printMutex.Unlock()
+				break
+			}
+			printMutex.Unlock()
+			fileMutex.Lock()
+			logutil.Info("backup", common.OperationField("copy file"),
+				common.AnyField("copy file size", copySize),
+				common.AnyField("copy file num", copyCount),
+				common.AnyField("total file num", len(files)))
+			fileMutex.Unlock()
+			time.Sleep(time.Second * 5)
+		}
+	}()
+
+	backupJobs := make([]*tasks.Job, len(files))
+	getJob := func(srcFs, dstFs fileservice.FileService, backupObject *objectio.BackupObject) *tasks.Job {
+		job := new(tasks.Job)
+		job.Init(copyCtx, backupObject.Location.Name().String(), tasks.JTAny,
+			func(jobCtx context.Context) *tasks.JobResult {
+				defer func() {
+					jobDone <- struct{}{}
+				}()
+
+				name := backupObject.Location.Name().String()
+				size := backupObject.Location.Extent().End() + objectio.FooterSize
+				if !backupObject.NeedCopy {
+					fileMutex.Lock()
+					copyCount++
+					copySize += int64(size)
+					taeFileList = append(taeFileList, &taeFile{
+						path:     name,
+						size:     int64(size),
+						needCopy: false,
+						ts:       backupObject.CrateTS,
+					})
+					fileMutex.Unlock()
+					return &tasks.JobResult{
+						Res: nil,
+					}
+				}
+				checksum, err := CopyFileWithRetry(jobCtx, srcFs, dstFs, backupObject.Location.Name().String(), "")
+				if err != nil {
+					cancelCopy(err)
+					return &tasks.JobResult{
+						Err: err,
+						Res: nil,
+					}
+				}
+				fileMutex.Lock()
+				copyCount++
+				copySize += int64(size)
+				taeFileList = append(taeFileList, &taeFile{
+					path:     name,
+					size:     int64(size),
+					checksum: checksum,
+					needCopy: backupObject.NeedCopy,
+					ts:       backupObject.CrateTS,
+				})
+				fileMutex.Unlock()
+				return &tasks.JobResult{
+					Res: nil,
+				}
+			})
+		return job
+	}
+
+	idx := 0
+	for n := range files {
+		backupJobs[idx] = getJob(srcFs, dstFs, files[n])
+		idx++
+	}
+
+	scheduledCount, completedCount, nextJob := 0, 0, 0
+	schedule := func(n int) bool {
+		if context.Cause(copyCtx) != nil {
+			return false
+		}
+		err := jobScheduler.Schedule(backupJobs[n])
+		if err != nil {
+			logutil.Infof("schedule job failed %v", err.Error())
+			cancelCopy(err)
+			return false
+		}
+		scheduledCount++
+		return true
+	}
+	for nextJob < len(backupJobs) && scheduledCount-completedCount < parallelCount {
+		if !schedule(nextJob) {
+			break
+		}
+		nextJob++
+	}
+	for completedCount < scheduledCount {
+		<-jobDone
+		completedCount++
+		if nextJob < len(backupJobs) && schedule(nextJob) {
+			nextJob++
+		}
+	}
+
+	var firstErr error
+	for n := 0; n < scheduledCount; n++ {
+		ret := backupJobs[n].WaitDone()
+		if ret.Err != nil && firstErr == nil {
+			logutil.Infof("wait job done failed %v", ret.Err.Error())
+			firstErr = ret.Err
+		}
+	}
+	if cause := context.Cause(copyCtx); cause != nil {
+		return nil, cause
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	logutil.Info("backup", common.OperationField("copy file"),
+		common.AnyField("copy file size", copySize),
+		common.AnyField("copy file num", copyCount),
+		common.AnyField("total file num", len(files)))
+	return taeFileList, nil
+}
+
+func execBackup(
+	ctx context.Context,
+	sid string,
+	srcFs, dstFs fileservice.FileService,
+	names []string,
+	count int,
+	ts types.TS,
+	typ string,
+	filesList *[]*taeFile,
+	protectionMgr *backupProtectionManager, // Optional: nil for tests, non-nil for production
+	globalIndex *GlobalFileIndex, // Optional: global file index for checking if file already backed up
+) error {
+	if len(names) < 2 {
+		return moerr.NewInternalErrorf(
+			ctx,
+			"incomplete backup checkpoint response: expected backup time and checkpoint location, got %d field(s)",
+			len(names),
+		)
+	}
+	if names[0] == "" {
+		return moerr.NewInternalError(ctx, "incomplete backup checkpoint response: backup time is empty")
+	}
+	if names[1] == "" {
+		return moerr.NewInternalError(ctx, "incomplete backup checkpoint response: checkpoint location is empty")
+	}
+
+	backupTime := names[0]
+	trimString := names[1]
+	names = names[1:]
+	var files map[string]*objectio.BackupObject
+	gcFileMap := make(map[string]string)
+	var err error
+	var loadDuration, copyDuration, reWriteDuration time.Duration
+	var oNames []*objectio.BackupObject
+	parallelNum := getParallelCount(count)
+	logutil.Info("backup", common.OperationField("start backup"),
+		common.AnyField("backup time", backupTime),
+		common.AnyField("checkpoint num", len(names)),
+		common.AnyField("parallel num", parallelNum))
+
+	defer func() {
+		logutil.Info("backup", common.OperationField("end backup"),
+			common.AnyField("load checkpoint cost", loadDuration),
+			common.AnyField("copy file cost", copyDuration),
+			common.AnyField("rewrite checkpoint cost", reWriteDuration))
+	}()
+	// The special checkpoint is rewritten to its start timestamp. Objects
+	// dropped before that timestamp are absent from the restored snapshot and
+	// may already have been collected by GC. Objects dropped at or after it
+	// remain live after the rewrite and must still be copied.
+	var cnLoc, mergeStart, mergeEnd string
+	var end, start types.TS
+	var version uint64
+	if trimString != "" {
+		ckpStr := strings.Split(trimString, ":")
+		if len(ckpStr) != 5 {
+			return moerr.NewInternalError(ctx, fmt.Sprintf("invalid checkpoint string: %v", ckpStr))
+		}
+		cnLoc = ckpStr[0]
+		mergeEnd = ckpStr[2]
+		// tnLoc = ckpStr[3]
+		mergeStart = ckpStr[4]
+		end = types.StringToTS(mergeEnd)
+		start = types.StringToTS(mergeStart)
+		version, err = strconv.ParseUint(ckpStr[1], 10, 32)
+		if err != nil {
+			return err
+		}
+	}
+
+	startTime := time.Now()
+	baseTS := ts
+	// When rewriting the checkpoint and trimming the aobject,
+	// you need to collect the atombstone in the last checkpoint
+	// Before this, only the last special checkpoint needs to be collected
+	var lastData *logtail.CKPReader
+	for i, name := range names {
+		if len(name) == 0 {
+			continue
+		}
+		ckpStr := strings.Split(name, ":")
+		if (i == 0 && len(ckpStr) != 5) || (i > 0 && len(ckpStr) != 2) {
+			return moerr.NewInternalError(ctx, fmt.Sprintf("invalid checkpoint string: %v", ckpStr))
+		}
+		metaLoc := ckpStr[0]
+		version, err := strconv.ParseUint(ckpStr[1], 10, 32)
+		if err != nil {
+			return err
+		}
+		key, err := objectio.StringToLocation(metaLoc)
+		if err != nil {
+			return err
+		}
+		var oneNames []*objectio.BackupObject
+		var data *logtail.CKPReader
+		oneNames, data, err = logtail.LoadCheckpointEntriesFromKey(
+			ctx,
+			sid,
+			srcFs,
+			key,
+			uint32(version),
+			nil,
+			&baseTS,
+		)
+		if err != nil {
+			return err
+		}
+		oNames = append(oNames, oneNames...)
+		if i == len(names)-1 {
+			lastData = data
+		}
+	}
+	loadDuration += time.Since(startTime)
+
+	dstObj, err := fileservice.SortedList(dstFs.List(ctx, ""))
+	dstHave := make(map[string]bool)
+	if err != nil {
+		return err
+	}
+	if len(dstObj) != 0 && dstObj[0].Name == fileList {
+		data, err := readFile(ctx, dstFs, fileList)
+		if err != nil {
+			return err
+		}
+		objects := strings.Split(string(data), "\n")
+		for _, object := range objects {
+			dstHave[object] = true
+		}
+	}
+	startTime = time.Now()
+	files = selectBackupObjects(oNames, start, dstHave, globalIndex)
+
+	// Set protectedTS to the backup time point
+	// This is the timestamp that should be protected from GC
+	// Use start if available (from trimString), otherwise use baseTS
+	var protectedTS types.TS
+	if !start.IsEmpty() {
+		protectedTS = start
+	} else if !baseTS.IsEmpty() {
+		protectedTS = baseTS
+	}
+
+	// Start backup protection if we have a valid timestamp and protection manager
+	// protectionMgr can be nil in test environments
+	if !protectedTS.IsEmpty() && protectionMgr != nil {
+		protectionMgr.start(protectedTS)
+	}
+
+	// copy data
+	taeFileList, err := parallelCopyData(ctx, srcFs, dstFs, files, parallelNum, gcFileMap)
+	if err != nil {
+		return err
+	}
+
+	// copy checkpoint and gc meta
+	sizeList, minTs, err := CopyCheckpointDir(ctx, srcFs, dstFs, "ckp", start)
+	if err != nil {
+		return err
+	}
+	taeFileList = append(taeFileList, sizeList...)
+	sizeList, err = CopyGCDir(ctx, srcFs, dstFs, "gc", start, minTs)
+	if err != nil {
+		return err
+	}
+	copyDuration += time.Since(startTime)
+	taeFileList = append(taeFileList, sizeList...)
+	startTime = time.Now()
+	if trimString != "" {
+		cnLocation, err := objectio.StringToLocation(cnLoc)
+		if err != nil {
+			return err
+		}
+		var (
+			checkpointFiles []string
+			tnLocation      objectio.Location
+		)
+		cnLocation, tnLocation, checkpointFiles, err = logtail.ReWriteCheckpointAndBlockFromKey(ctx, sid, srcFs, dstFs,
+			cnLocation, lastData, uint32(version), start)
+		for _, name := range checkpointFiles {
+			dentry, err := dstFs.StatFile(ctx, name)
+			if err != nil {
+				return err
+			}
+			taeFileList = append(taeFileList, &taeFile{
+				path:     dentry.Name,
+				size:     dentry.Size,
+				needCopy: true,
+				ts:       start,
+			})
+		}
+		if err != nil {
+			return err
+		}
+		file, err := checkpoint.MergeCkpMeta(ctx, sid, dstFs, cnLocation, tnLocation, start, end)
+		if err != nil {
+			return err
+		}
+		dentry, err := dstFs.StatFile(ctx, file)
+		if err != nil {
+			return err
+		}
+		taeFileList = append(taeFileList, &taeFile{
+			path:     "ckp/" + dentry.Name,
+			size:     dentry.Size,
+			needCopy: true,
+			ts:       start,
+		})
+	}
+	reWriteDuration += time.Since(startTime)
+	for _, file := range taeFileList {
+		if dstHave[file.path] {
+			file.needCopy = true
+		}
+	}
+	//save tae files size
+	err = saveTaeFilesList(ctx, dstFs, taeFileList, backupTime, start.ToString(), typ)
+	if err != nil {
+		return err
+	}
+	if filesList != nil && len(taeFileList) > 0 {
+		*filesList = append(*filesList, taeFileList...)
+	}
+	return err
+}
+
+func selectBackupObjects(
+	oNames []*objectio.BackupObject,
+	restoreTS types.TS,
+	dstHave map[string]bool,
+	globalIndex *GlobalFileIndex,
+) map[string]*objectio.BackupObject {
+	files := make(map[string]*objectio.BackupObject, len(oNames))
+	for _, oName := range oNames {
+		objName := oName.Location.Name().String()
+		// A DropTS alone does not prove that an object is absent from the
+		// snapshot being restored. The special checkpoint rewrite makes objects
+		// dropped at or after restoreTS live again, so only an earlier DropTS is
+		// safe to omit.
+		if !restoreTS.IsEmpty() && !oName.DropTS.IsEmpty() && oName.DropTS.LT(&restoreTS) {
+			continue
+		}
+		// Check if file already exists in current backup directory
+		if dstHave[objName] {
+			oName.NeedCopy = false
+		}
+		// Check if file exists in global index (already backed up in previous backups)
+		if globalIndex != nil && globalIndex.Has(objName) {
+			oName.NeedCopy = false
+		}
+		if files[objName] == nil {
+			files[objName] = oName
+		}
+	}
+	return files
+}
+
+// CopyCheckpointDir copy checkpoint dir from srcFs to dstFs
+// return taeFile list
+// doCopy: if doCopy is true,it means not to check the suffix name and doCopy all files.
+func copyFileAndGetMetaFiles(
+	ctx context.Context,
+	srcFs, dstFs fileservice.FileService,
+	dir string,
+	backup types.TS,
+	decoder func(string) ioutil.TSRangeFile,
+	doCopy bool,
+) ([]*taeFile, []ioutil.TSRangeFile, []fileservice.DirEntry, error) {
+	mFiles, err := fileservice.SortedList(srcFs.List(ctx, dir))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	taeFileList := make([]*taeFile, 0, len(mFiles))
+	metaFiles := make([]ioutil.TSRangeFile, 0)
+	var checksum []byte
+	for i, file := range mFiles {
+		if file.IsDir {
+			panic("not support dir")
+		}
+		meta := decoder(file.Name)
+		meta.SetIdx(i)
+
+		if !backup.IsEmpty() {
+			start := meta.GetStart()
+			end := meta.GetEnd()
+			// Skip if end timestamp is greater than backup time point
+			if !end.IsEmpty() && end.GT(&backup) {
+				logutil.Infof("[Backup] skip file %v (end %v > backup %v)", file.Name, end.ToString(), backup.ToString())
+				continue
+			}
+			// Also check start timestamp (original logic)
+			if !start.IsEmpty() && start.GE(&backup) {
+				logutil.Infof("[Backup] skip file %v (start %v >= backup %v)", file.Name, start.ToString(), backup.ToString())
+				continue
+			}
+		}
+		if doCopy || meta.IsAcctExt() || meta.IsSnapshotExt() {
+			checksum, err = CopyFileWithRetry(ctx, srcFs, dstFs, file.Name, dir)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			taeFileList = append(taeFileList, &taeFile{
+				path:     dir + string(os.PathSeparator) + file.Name,
+				size:     file.Size,
+				checksum: checksum,
+				needCopy: true,
+				ts:       backup,
+			})
+		}
+
+		if doCopy || meta.IsCKPFile() || meta.IsFullGCExt() {
+			metaFiles = append(metaFiles, meta)
+		}
+	}
+
+	if len(metaFiles) == 0 {
+		return taeFileList, metaFiles, mFiles, nil
+	}
+	slices.SortFunc(metaFiles, func(a, b ioutil.TSRangeFile) int {
+		if a.GetEnd().LT(b.GetEnd()) {
+			return -1
+		}
+		if b.GetEnd().LT(a.GetEnd()) {
+			return 1
+		}
+		return 0
+	})
+
+	return taeFileList, metaFiles, mFiles, nil
+}
+
+func CopyGCDir(
+	ctx context.Context,
+	srcFs, dstFs fileservice.FileService,
+	dir string,
+	backup, min types.TS,
+) ([]*taeFile, error) {
+	var checksum []byte
+
+	taeFiles, metaFiles, files, err := copyFileAndGetMetaFiles(
+		ctx, srcFs, dstFs, dir, backup, ioutil.DecodeGCMetadataName, false,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	copyFiles := make([]ioutil.TSRangeFile, 0)
+
+	for _, metaFile := range metaFiles {
+		window := gc.NewGCWindow(common.DebugAllocator, srcFs)
+		err = window.ReadTable(ctx, metaFile.GetGCFullName(), srcFs)
+		if err != nil {
+			return nil, err
+		}
+		defer window.Close()
+		objects := window.GetObjectStats()
+		filesList := make([]*taeFile, 0)
+		needCopy := true
+		for _, object := range objects {
+			objectName := object.ObjectName().String()
+			checksum, err = CopyFileWithRetry(ctx, srcFs, dstFs, objectName, "")
+			if err != nil {
+				logutil.Warnf("[Backup] copy file %v failed", objectName)
+				needCopy = false
+				break
+			}
+			entry, err := dstFs.StatFile(ctx, objectName)
+			if err != nil {
+				return nil, err
+			}
+			filesList = append(filesList, &taeFile{
+				path:     objectName,
+				size:     entry.Size,
+				checksum: checksum,
+				needCopy: true,
+				ts:       backup,
+			})
+		}
+		if needCopy {
+			copyFiles = append(copyFiles, metaFile)
+			taeFiles = append(taeFiles, filesList...)
+		}
+	}
+
+	for i, metaFile := range copyFiles {
+		name := metaFile.GetName()
+		if i == len(copyFiles)-1 {
+			if !min.IsEmpty() && metaFile.GetEnd().LT(&min) {
+				// It means that the gc consumption is too slow, and the gc water level needs to be raised.
+				// Otherwise, the gc will not work after the cluster is restored because it cannot find the checkpoint.
+				// The gc water level is determined by the name of the meta,
+				// so the name of the last gc meta needs to be modified.
+				name = ioutil.InheritGCMetadataName(name, metaFile.GetEnd(), &min)
+			}
+		}
+		checksum, err = CopyFileWithRetry(ctx, srcFs, dstFs, metaFile.GetName(), dir, name)
+		if err != nil {
+			return nil, err
+		}
+		taeFiles = append(taeFiles, &taeFile{
+			path:     dir + string(os.PathSeparator) + name,
+			size:     files[metaFile.GetIdx()].Size,
+			checksum: checksum,
+			needCopy: true,
+			ts:       backup,
+		})
+	}
+	return taeFiles, nil
+}
+
+func CopyCheckpointDir(
+	ctx context.Context,
+	srcFs, dstFs fileservice.FileService,
+	dir string, backup types.TS,
+) ([]*taeFile, types.TS, error) {
+	decoder := func(name string) ioutil.TSRangeFile {
+		meta := ioutil.DecodeCKPMetaName(name)
+		meta.SetExt("")
+		return meta
+	}
+	taeFiles, metaFiles, _, err := copyFileAndGetMetaFiles(
+		ctx, srcFs, dstFs, dir, backup, decoder, true,
+	)
+	if err != nil {
+		return nil, types.TS{}, err
+	}
+
+	// minTs is the end of the last global checkpoint, which is needed when copying gc meta
+	minTs := types.TS{}
+	for i := len(metaFiles) - 1; i >= 0; i-- {
+		ckpStart := metaFiles[i].GetStart()
+		if ckpStart.IsEmpty() {
+			minTs = *metaFiles[i].GetEnd()
+			break
+		}
+	}
+	return taeFiles, minTs, nil
+}
+
+type copiedObjectChecksumError struct {
+	err error
+}
+
+func (e *copiedObjectChecksumError) Error() string {
+	return "checksum copied backup object: " + e.err.Error()
+}
+
+func (e *copiedObjectChecksumError) Unwrap() error {
+	return e.err
+}
+
+func CopyFileWithRetry(ctx context.Context, srcFs, dstFs fileservice.FileService, name, dstDir string, newName ...string) ([]byte, error) {
+	return fileservice.DoWithRetryContext(
+		ctx,
+		"CopyFile",
+		func() ([]byte, error) {
+			return CopyFile(ctx, srcFs, dstFs, name, dstDir, newName...)
+		},
+		64,
+		func(err error) bool {
+			var checksumErr *copiedObjectChecksumError
+			return !errors.As(err, &checksumErr) && fileservice.IsRetryableError(err)
+		},
+	)
+}
+
+// CopyFile copy file from srcFs to dstFs and return checksum of the written file.
+func CopyFile(ctx context.Context, srcFs, dstFs fileservice.FileService, name, dstDir string, newNames ...string) ([]byte, error) {
+	newName := name
+	if dstDir != "" {
+		name = path.Join(dstDir, name)
+		if len(newNames) > 0 {
+			newName = path.Join(dstDir, newNames[0])
+		} else {
+			newName = name
+		}
+	}
+
+	if copier, ok := dstFs.(fileservice.ObjectCopier); ok {
+		copied, err := copier.CopyObject(ctx, srcFs, name, newName)
+		if err != nil {
+			return nil, err
+		}
+		if copied {
+			// Hash the copied object itself. Provider-side copy avoids opening a
+			// source response in CN while the destination operation needs an
+			// HTTP connection, and the checksum still describes the bytes that
+			// were actually written to the backup.
+			checksum, err := fileservice.DoWithRetryContext(
+				ctx,
+				"ChecksumCopiedBackupObject",
+				func() ([]byte, error) {
+					return checksumFile(ctx, dstFs, newName)
+				},
+				64,
+				fileservice.IsRetryableError,
+			)
+			if err != nil {
+				// CopyFileWithRetry must not repeat a successful provider copy:
+				// the destination now exists, so retry only this checksum phase.
+				return nil, &copiedObjectChecksumError{err: err}
+			}
+			return checksum, nil
+		}
+	}
+
+	return streamCopyFile(ctx, srcFs, dstFs, name, newName)
+}
+
+func checksumFile(ctx context.Context, fs fileservice.FileService, name string) (checksum []byte, err error) {
+	var reader io.ReadCloser
+	ioVec := &fileservice.IOVector{
+		FilePath: name,
+		Entries: []fileservice.IOEntry{
+			{
+				ReadCloserForRead: &reader,
+				Offset:            0,
+				Size:              -1,
+			},
+		},
+		Policy: fileservice.SkipAllCache,
+	}
+
+	err = fs.Read(ctx, ioVec)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := reader.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+
+	hasher := sha256.New()
+	if _, err = io.Copy(hasher, reader); err != nil {
+		return nil, err
+	}
+	return hasher.Sum(nil), nil
+}
+
+func streamCopyFile(
+	ctx context.Context,
+	srcFs, dstFs fileservice.FileService,
+	name, newName string,
+) ([]byte, error) {
+	var reader io.ReadCloser
+	ioVec := &fileservice.IOVector{
+		FilePath: name,
+		Entries: []fileservice.IOEntry{
+			{
+				ReadCloserForRead: &reader,
+				Offset:            0,
+				Size:              -1,
+			},
+		},
+		Policy: fileservice.SkipAllCache,
+	}
+
+	err := srcFs.Read(ctx, ioVec)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	hasher := sha256.New()
+	hashingReader := io.TeeReader(reader, hasher)
+	dstIoVec := fileservice.IOVector{
+		FilePath: newName,
+		Entries: []fileservice.IOEntry{
+			{
+				ReaderForWrite: hashingReader,
+				Offset:         0,
+				Size:           -1,
+			},
+		},
+		Policy: fileservice.SkipAllCache,
+	}
+
+	err = dstFs.Write(ctx, dstIoVec)
+	if err != nil {
+		return nil, err
+	}
+	return hasher.Sum(nil), nil
+}
+
+// getSQLExecutor tries to get SQL executor from runtime
+// Returns (executor, opts) if available, (nil, empty opts) otherwise
+//func getSQLExecutor(sid string) (executor.SQLExecutor, executor.Options) {
+//	v, ok := runtime.ServiceRuntime(sid).GetGlobalVariables(runtime.InternalSQLExecutor)
+//	if !ok {
+//		return nil, executor.Options{}
+//	}
+//	return v.(executor.SQLExecutor), executor.Options{}
+//}
+
+// buildBackupProtectionSQL builds the SQL command for backup protection
+func buildBackupProtectionSQL(protectedTS types.TS) string {
+	tsValue := protectedTS.ToString()
+	return fmt.Sprintf("select mo_ctl('dn','DiskCleaner','%s%s')", backupProtectionCmdPrefix, tsValue)
+}
+
+// buildRemoveBackupProtectionSQL builds the SQL command to remove backup protection
+func buildRemoveBackupProtectionSQL() string {
+	return fmt.Sprintf("select mo_ctl('dn','DiskCleaner','%s')", backupProtectionRemoveCmd)
+}
+
+// backupProtectionManager manages backup protection lifecycle
+type backupProtectionManager struct {
+	ctx            context.Context
+	exec           executor.SQLExecutor
+	opts           executor.Options
+	protectedTS    types.TS
+	updateTicker   *time.Ticker
+	updateStopChan chan struct{}
+	protectionSet  bool
+}
+
+// newBackupProtectionManager creates a new backup protection manager
+func newBackupProtectionManager(ctx context.Context, exec executor.SQLExecutor, opts executor.Options) *backupProtectionManager {
+	return &backupProtectionManager{
+		ctx:            ctx,
+		exec:           exec,
+		opts:           opts,
+		updateStopChan: make(chan struct{}),
+	}
+}
+
+// start starts backup protection with the given timestamp
+func (mgr *backupProtectionManager) start(protectedTS types.TS) {
+	mgr.protectedTS = protectedTS
+
+	if mgr.exec == nil {
+		logutil.Warn("backup: SQL executor not available, backup protection will not be set")
+		return
+	}
+
+	// Set backup protection via mo_ctl
+	sql := buildBackupProtectionSQL(protectedTS)
+	_, err := mgr.exec.Exec(mgr.ctx, sql, mgr.opts)
+	if err != nil {
+		logutil.Errorf("backup: failed to set backup protection: %v", err)
+		// Continue backup even if protection setup fails, but log the error
+		return
+	}
+
+	mgr.protectionSet = true
+	logutil.Info("backup: backup protection set",
+		common.AnyField("protected-ts", protectedTS.ToString()))
+
+	// Start a ticker to update backup protection periodically
+	mgr.updateTicker = time.NewTicker(backupProtectionUpdateInterval)
+	go mgr.updateLoop()
+}
+
+// updateLoop runs in a goroutine to periodically update backup protection
+func (mgr *backupProtectionManager) updateLoop() {
+	for {
+		select {
+		case <-mgr.updateTicker.C:
+			mgr.updateProtection()
+		case <-mgr.updateStopChan:
+			return
+		case <-mgr.ctx.Done():
+			return
+		}
+	}
+}
+
+// updateProtection updates the backup protection timestamp
+func (mgr *backupProtectionManager) updateProtection() {
+	if mgr.exec == nil {
+		return
+	}
+	sql := buildBackupProtectionSQL(mgr.protectedTS)
+	_, err := mgr.exec.Exec(mgr.ctx, sql, mgr.opts)
+	if err != nil {
+		logutil.Errorf("backup: failed to update backup protection: %v", err)
+	} else {
+		logutil.Info("backup: backup protection updated")
+	}
+}
+
+// cleanup stops the update ticker and removes backup protection
+// IMPORTANT: Close the channel first to signal the goroutine to exit,
+// then stop the ticker. This prevents deadlock if exec.Exec is blocking
+// in the goroutine. If we stop the ticker first, the goroutine might be
+// stuck in exec.Exec and unable to check updateStopChan channel.
+func (mgr *backupProtectionManager) cleanup() {
+	// Stop the update ticker
+	if mgr.updateTicker != nil {
+		// Close channel first to signal goroutine to exit
+		close(mgr.updateStopChan)
+		// Then stop the ticker (this is safe even if goroutine is still running)
+		mgr.updateTicker.Stop()
+	}
+
+	// Remove backup protection if it was set
+	if mgr.protectionSet && mgr.exec != nil {
+		sql := buildRemoveBackupProtectionSQL()
+		_, err := mgr.exec.Exec(mgr.ctx, sql, mgr.opts)
+		if err != nil {
+			logutil.Errorf("backup: failed to remove backup protection: %v", err)
+		} else {
+			logutil.Info("backup: backup protection removed")
+		}
+	}
+}

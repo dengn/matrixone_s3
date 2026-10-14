@@ -1,0 +1,37 @@
+{
+  "prefix": "databases/complete/network-2b95c222-8665-45ed-aef5-442d19072f60",
+  "extra_s3_get_delay_ms": 30,
+  "freshness_window_ms": 250,
+  "checks": [
+    "60 bounded queries use background observations with no foreground S3 HEAD",
+    "bounded warm query median excludes injected network wait",
+    "10 prefetched updates: fresh prepared SQL, stable PID, connection and session",
+    "strict mode keeps immediate committed visibility",
+    "stalled background WAL download does not lock a cached SQL query",
+    "background prefetch keeps transaction snapshot pinned",
+    "S3 outage after freshness window expires fails instead of silently returning old data",
+    "same connection resumes after S3 recovery",
+    "idle reader backs off S3 polling and wakes on a new query",
+    "close joins the background worker"
+  ],
+  "strict_query": {
+    "median_ms": 36.47110400197562,
+    "p95_ms": 63.4380709961988,
+    "count": 15
+  },
+  "bounded_query": {
+    "median_ms": 0.4420654950081371,
+    "p95_ms": 1.2212959991302341,
+    "count": 60
+  },
+  "hot_query_foreground_heads": 0,
+  "prefetched_update_query": {
+    "median_ms": 2.208990503277164,
+    "p95_ms": 15.741384995635599,
+    "count": 10
+  },
+  "query_during_stalled_prefetch_ms": 1.426518996595405,
+  "outage_error_type": "ClientError",
+  "idle_heads_in_1_2_seconds": 1,
+  "status": "passed"
+}

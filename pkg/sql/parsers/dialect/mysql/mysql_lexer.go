@@ -1,0 +1,686 @@
+// Copyright 2021 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package mysql
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"strconv"
+	"strings"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	commonutil "github.com/matrixorigin/matrixone/pkg/common/util"
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect"
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+)
+
+type MySQLParser struct {
+	scanner Scanner
+	lexer   Lexer
+	// use this will save some memory allocation
+	// parser  yyParserImpl
+}
+
+func integralToUint64(v any) uint64 {
+	switch value := v.(type) {
+	case int64:
+		return uint64(value)
+	case uint64:
+		return value
+	default:
+		panic(fmt.Sprintf("unexpected integral type %T", v))
+	}
+}
+
+func (p *MySQLParser) Parse(ctx context.Context, sql string, lower int64) ([]tree.Statement, error) {
+	return p.ParseWithSQLMode(ctx, sql, lower, "")
+}
+
+func (p *MySQLParser) ParseWithSQLMode(ctx context.Context, sql string, lower int64, sqlMode string) ([]tree.Statement, error) {
+	p.scanner.setSql(sql)
+	p.scanner.setSQLMode(ParseSQLModeFlags(sqlMode))
+	p.lexer.setScanner(&p.scanner, lower, ParseSQLModeFlags(sqlMode))
+
+	/*
+		The following can potentially save some memory allocation, but it exposes too much
+		of yyParser internals, which is really yacc's business, not ours.
+		I don't think it's worth it.
+
+		p.parser.yySymType = &yySymType{}
+		for i := 0; i < len(p.parser.stack); i++ {
+			p.parser.stack[i] = yySymType{}
+		}
+		p.parser.char = 0
+	*/
+
+	if yyParse(&p.lexer) != 0 {
+		for _, s := range p.lexer.stmts {
+			s.Free()
+		}
+		return nil, p.lexer.scanner.LastError
+	}
+	if err := validateSelectIntoStatements(&p.lexer); err != nil {
+		for _, s := range p.lexer.stmts {
+			s.Free()
+		}
+		return nil, err
+	}
+	if len(p.lexer.stmts) == 0 {
+		/**
+		For CORNER CASE like:
+
+		mysql> -- MySQL dump 10.13  Distrib 8.1.0, for macos11.7 (arm64)
+
+		the input will be stripped to empty string, and the parser will return 0 stmts.
+		but, the mysql server responds ok to the client.
+		so, we return an EmptyStmt that does nothing beside responding ok.
+		*/
+		return []tree.Statement{&tree.EmptyStmt{}}, nil
+	}
+	return p.lexer.stmts, nil
+}
+
+// ParseFirstWithSQLMode parses the first top-level statement and returns the
+// byte offset immediately after its delimiter. It stops the lexer as soon as
+// the first statement is reduced, so compound statements are scanned once.
+func (p *MySQLParser) ParseFirstWithSQLMode(ctx context.Context, sql string, lower int64, sqlMode string) (tree.Statement, int, error) {
+	p.scanner.setSql(sql)
+	p.scanner.setSQLMode(ParseSQLModeFlags(sqlMode))
+	p.lexer.setScanner(&p.scanner, lower, ParseSQLModeFlags(sqlMode))
+	p.lexer.parseFirst = true
+
+	if yyParse(&p.lexer) != 0 {
+		for _, s := range p.lexer.stmts {
+			s.Free()
+		}
+		return nil, 0, p.lexer.scanner.LastError
+	}
+	if err := validateSelectIntoStatements(&p.lexer); err != nil {
+		for _, s := range p.lexer.stmts {
+			s.Free()
+		}
+		return nil, 0, err
+	}
+	if len(p.lexer.stmts) == 0 {
+		return &tree.EmptyStmt{}, len(sql), nil
+	}
+	end := p.lexer.statementEnd
+	if p.lexer.lastToken != int(';') && end < len(sql) {
+		token, _ := p.scanner.Scan()
+		switch token {
+		case int(';'):
+			end = p.scanner.Pos
+		case 0, EofChar():
+			end = len(sql)
+		default:
+			p.lexer.stmts[0].Free()
+			p.lexer.Error("syntax error")
+			return nil, 0, p.lexer.scanner.LastError
+		}
+	}
+	return p.lexer.stmts[0], end, nil
+}
+
+func Parse(ctx context.Context, sql string, lower int64) ([]tree.Statement, error) {
+	return ParseWithSQLMode(ctx, sql, lower, "")
+}
+
+func ParseWithSQLMode(ctx context.Context, sql string, lower int64, sqlMode string) (statements []tree.Statement, err error) {
+	lexer := NewLexerWithSQLMode(dialect.MYSQL, sql, lower, ParseSQLModeFlags(sqlMode))
+	defer PutScanner(lexer.scanner)
+	if limits, ok := ctx.Value(parseLimitsKey{}).(ParseLimits); ok {
+		if cause := context.Cause(ctx); cause != nil {
+			return nil, cause
+		}
+		if len(sql) > limits.Input {
+			return nil, ErrParseLimit
+		}
+		control := &parseControl{ctx: ctx, limits: limits}
+		lexer.scanner.parseControl = control
+		defer func() {
+			if failure := recover(); failure != nil {
+				abort, own := failure.(parseAbort)
+				if !own || abort.control != control {
+					panic(failure)
+				}
+				for _, statement := range lexer.stmts {
+					statement.Free()
+				}
+				statements, err = nil, abort.err
+			}
+		}()
+	}
+
+	if yyParse(lexer) != 0 {
+		for _, s := range lexer.stmts {
+			s.Free()
+		}
+		return nil, lexer.scanner.LastError
+	}
+	if err := validateSelectIntoStatements(lexer); err != nil {
+		for _, s := range lexer.stmts {
+			s.Free()
+		}
+		return nil, err
+	}
+	if len(lexer.stmts) == 0 {
+		/**
+		For CORNER CASE like:
+
+		mysql> -- MySQL dump 10.13  Distrib 8.1.0, for macos11.7 (arm64)
+
+		the input will be stripped to empty string, and the parser will return 0 stmts.
+		but, the mysql server responds ok to the client.
+		so, we return an EmptyStmt that does nothing beside responding ok.
+		*/
+		return []tree.Statement{&tree.EmptyStmt{}}, nil
+	}
+	return lexer.stmts, nil
+}
+
+func ParseOne(ctx context.Context, sql string, lower int64) (tree.Statement, error) {
+	return ParseOneWithSQLMode(ctx, sql, lower, "")
+}
+
+func ParseOneWithSQLMode(ctx context.Context, sql string, lower int64, sqlMode string) (tree.Statement, error) {
+	lexer := NewLexerWithSQLMode(dialect.MYSQL, sql, lower, ParseSQLModeFlags(sqlMode))
+	defer PutScanner(lexer.scanner)
+	if yyParse(lexer) != 0 {
+		for _, s := range lexer.stmts {
+			s.Free()
+		}
+		return nil, lexer.scanner.LastError
+	}
+	if err := validateSelectIntoStatements(lexer); err != nil {
+		for _, s := range lexer.stmts {
+			s.Free()
+		}
+		return nil, err
+	}
+	if len(lexer.stmts) != 1 {
+		for _, s := range lexer.stmts {
+			s.Free()
+		}
+		return nil, moerr.NewParseError(ctx, "syntax error, or too many sql to parse")
+	}
+	return lexer.stmts[0], nil
+}
+
+type Lexer struct {
+	scanner               *Scanner
+	stmts                 []tree.Statement
+	paramIndex            int
+	lower                 int64
+	lastToken             int
+	previousToken         int
+	syntaxLastToken       int
+	syntaxDepth           int
+	syntaxInFrom          []bool
+	tableParenStack       []bool
+	lastClosedTableParen  bool
+	topLevelSemicolonEnds []int
+	sqlMode               SQLModeFlags
+	parseFirst            bool
+	stopLexing            bool
+	statementEnd          int
+}
+
+// reservedKeywordsAfterAS lists tokens that represent reserved keywords
+// which should be treated as identifiers when they follow AS (aliases).
+// This allows statements like SELECT 1 AS rows or SELECT NOW() AS current_time.
+var reservedKeywordsAfterAS = map[int]bool{
+	ROWS:              true,
+	CURRENT_TIME:      true,
+	CURRENT_TIMESTAMP: true,
+	LOCALTIME:         true,
+	LOCALTIMESTAMP:    true,
+}
+
+func NewLexer(dialectType dialect.DialectType, sql string, lower int64) *Lexer {
+	return NewLexerWithSQLMode(dialectType, sql, lower, 0)
+}
+
+func NewLexerWithSQLMode(dialectType dialect.DialectType, sql string, lower int64, sqlMode SQLModeFlags) *Lexer {
+	scanner := NewScanner(dialectType, sql)
+	scanner.setSQLMode(sqlMode)
+	return &Lexer{
+		scanner:    scanner,
+		paramIndex: 0,
+		lower:      lower,
+		sqlMode:    sqlMode,
+	}
+}
+
+func (l *Lexer) setScanner(s *Scanner, lower int64, sqlMode SQLModeFlags) {
+	l.scanner = s
+	l.stmts = nil
+	l.paramIndex = 0
+	l.lower = lower
+	l.lastToken = 0
+	l.previousToken = 0
+	l.syntaxLastToken = 0
+	l.syntaxDepth = 0
+	l.syntaxInFrom = l.syntaxInFrom[:0]
+	l.tableParenStack = l.tableParenStack[:0]
+	l.lastClosedTableParen = false
+	l.topLevelSemicolonEnds = nil
+	l.sqlMode = sqlMode
+	l.parseFirst = false
+	l.stopLexing = false
+	l.statementEnd = 0
+}
+
+func (l *Lexer) HasSQLMode(flag SQLModeFlag) bool {
+	return l.sqlMode.Has(flag)
+}
+
+func (l *Lexer) isSQLModeReservedFunctionName(name string) bool {
+	if !isSQLModeSensitiveFunctionName(name) {
+		return false
+	}
+	// MySQL permits a reserved function name as a component after the
+	// qualification dot, for example `src.count`. The identifier reduction is
+	// shared by unqualified names and qualified-name components, so preserve
+	// that distinction before applying the function-name rule.
+	if l.previousToken == int('.') {
+		return false
+	}
+	if l.HasSQLMode(SQLModeIgnoreSpace) {
+		return true
+	}
+
+	// Without IGNORE_SPACE, a sensitive function token is still reserved when
+	// it is followed immediately by `(`. The lexer turns the whitespace form
+	// into ID, but leaves the no-whitespace form as the keyword token. During
+	// ident reduction the scanner may still point at `(`; the token-state
+	// fallback covers the case where that lookahead has already been fetched.
+	keywordID, ok := keywords[strings.ToLower(name)]
+	if !ok {
+		return false
+	}
+	if l.scanner.Pos < len(l.scanner.buf) && l.scanner.buf[l.scanner.Pos] == '(' {
+		return true
+	}
+	return l.lastToken == int('(') && l.previousToken == keywordID
+}
+
+func rejectSQLModeReservedFunctionName(yylex yyLexer, name string) bool {
+	lexer := yylex.(*Lexer)
+	if !lexer.isSQLModeReservedFunctionName(name) {
+		return false
+	}
+	message := fmt.Sprintf("function name '%s' is reserved", name)
+	if lexer.HasSQLMode(SQLModeIgnoreSpace) {
+		message += " in IGNORE_SPACE mode"
+	}
+	lexer.Error(message)
+	return true
+}
+
+func (l *Lexer) GetParamIndex() int {
+	l.paramIndex = l.paramIndex + 1
+	return l.paramIndex
+}
+
+func (l *Lexer) Lex(lval *yySymType) int {
+	l.scanner.parseControl.token()
+	if l.stopLexing {
+		return 0
+	}
+	typ, str := l.scanner.Scan()
+	lval.pos = l.scanner.Pos
+	l.scanner.LastToken = str
+	// yacc precedence is static, so HIGH_NOT_PRECEDENCE uses a distinct token
+	// that the grammar places at the unary-operator precedence.
+	if typ == NOT && l.HasSQLMode(SQLModeHighNotPrecedence) {
+		typ = HIGH_NOT
+	}
+	if typ == OFFSET && l.syntaxLastToken == int(')') && l.lastClosedTableParen && l.scanner.offsetAliasColumnListAhead() {
+		// OFFSET is non-reserved. In a table-factor context, the established
+		// `(...) offset (c1, c2)` syntax is an implicit alias plus column list,
+		// not an offset-only query clause.
+		typ = ID
+	}
+
+	if typ == FOR {
+		snapshot := *l.scanner
+		nextTyp, nextStr := l.scanner.Scan()
+		if nextTyp == ICEBERG {
+			afterIceberg := *l.scanner
+			afterTyp, _ := l.scanner.Scan()
+			if afterTyp == SNAPSHOT || afterTyp == TIMESTAMP || afterTyp == REF {
+				l.previousToken = l.lastToken
+				l.lastToken = FOR_ICEBERG
+				lval.str = str + " " + nextStr
+				l.scanner.LastToken = lval.str
+				*l.scanner = afterIceberg
+				l.recordSyntaxToken(FOR_ICEBERG)
+				return FOR_ICEBERG
+			}
+		}
+		*l.scanner = snapshot
+	}
+
+	switch typ {
+	case INTEGRAL:
+		l.recordSyntaxToken(typ)
+		return l.toInt(lval, str)
+	case FLOAT:
+		l.recordSyntaxToken(typ)
+		return l.toFloat(lval, str)
+	}
+
+	// Allow reserved keywords as aliases after AS.
+	// MySQL treats most keywords as identifiers in alias context, e.g.:
+	//   SELECT NOW() AS current_time, COUNT(*) AS rows FROM t
+	if reservedKeywordsAfterAS[typ] && l.lastToken == AS {
+		typ = ID
+	}
+	// CONFIG is a MatrixOne contextual keyword used by SHOW CONFIG and ALTER
+	// ACCOUNT CONFIG. MySQL otherwise treats it as a non-reserved identifier.
+	if typ == CONFIG && l.lastToken != SHOW &&
+		!(l.previousToken == ALTER && l.lastToken == ACCOUNT && l.alterAccountConfigPhraseAhead()) {
+		typ = ID
+	}
+	// ASOF stays contextual. The grammar resolves whether the phrase starts a
+	// native join or whether ASOF still occupies the current table's alias slot.
+	// This preserves legacy `t asof JOIN u`, while an already completed alias or
+	// table-factor suffix makes the same phrase a native ASOF JOIN.
+	if typ == ID && strings.EqualFold(str, "asof") && l.asofJoinPhraseAhead() {
+		typ = ASOF
+	}
+
+	l.previousToken = l.lastToken
+	l.lastToken = typ
+	lval.str = str
+	l.recordSyntaxToken(typ)
+	return typ
+}
+
+func (l *Lexer) alterAccountConfigPhraseAhead() bool {
+	lookahead := *l.scanner
+
+	// ALTER ACCOUNT CONFIG SET MYSQL_COMPATIBILITY_MODE ...
+	next, _ := lookahead.Scan()
+	if next == SET {
+		next, _ = lookahead.Scan()
+		return next == MYSQL_COMPATIBILITY_MODE
+	}
+
+	// ALTER ACCOUNT CONFIG account_name SET MYSQL_COMPATIBILITY_MODE ...
+	next, _ = lookahead.Scan()
+	if next != SET {
+		return false
+	}
+	next, _ = lookahead.Scan()
+	return next == MYSQL_COMPATIBILITY_MODE
+}
+
+func (l *Lexer) asofJoinPhraseAhead() bool {
+	lookahead := Scanner{}
+	lookahead.setSql(l.scanner.buf[l.scanner.Pos:])
+	lookahead.setSQLMode(l.sqlMode)
+
+	next, _ := lookahead.Scan()
+	if next == JOIN {
+		return true
+	}
+	if next != LEFT {
+		return false
+	}
+	next, _ = lookahead.Scan()
+	if next == JOIN {
+		return true
+	}
+	if next != OUTER {
+		return false
+	}
+	next, _ = lookahead.Scan()
+	return next == JOIN
+}
+
+// hasAsofLeftFactorAlias follows the right edge of a table-reference chain,
+// which is the table factor immediately preceding an ASOF modifier.
+func hasAsofLeftFactorAlias(expr tree.TableExpr) bool {
+	for expr != nil {
+		switch e := expr.(type) {
+		case *tree.AliasedTableExpr:
+			return e.As.Alias != ""
+		case *tree.JoinTableExpr:
+			if e.Right != nil {
+				expr = e.Right
+			} else {
+				expr = e.Left
+			}
+		case *tree.ApplyTableExpr:
+			expr = e.Right
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func (l *Lexer) recordSyntaxToken(token int) {
+	if token == int(';') {
+		l.syntaxLastToken = token
+		l.syntaxDepth = 0
+		l.syntaxInFrom = l.syntaxInFrom[:0]
+		l.tableParenStack = l.tableParenStack[:0]
+		l.lastClosedTableParen = false
+		return
+	}
+	for len(l.syntaxInFrom) <= l.syntaxDepth {
+		l.syntaxInFrom = append(l.syntaxInFrom, false)
+	}
+
+	switch token {
+	case SELECT:
+		l.syntaxInFrom[l.syntaxDepth] = false
+	case FROM:
+		l.syntaxInFrom[l.syntaxDepth] = true
+	case WHERE, GROUP, HAVING, ORDER, LIMIT, OFFSET,
+		UNION, EXCEPT, INTERSECT, MINUS, RETURNING, SET:
+		l.syntaxInFrom[l.syntaxDepth] = false
+	case int('('):
+		tableStart := isTableFactorStart(l.syntaxLastToken) ||
+			(l.syntaxLastToken == int('(') && len(l.tableParenStack) > 0 && l.tableParenStack[len(l.tableParenStack)-1]) ||
+			(l.syntaxLastToken == int(',') && l.syntaxInFrom[l.syntaxDepth])
+		l.tableParenStack = append(l.tableParenStack, tableStart)
+		l.syntaxDepth++
+	case int(')'):
+		l.lastClosedTableParen = false
+		if l.syntaxDepth > 0 {
+			l.syntaxDepth--
+			if len(l.syntaxInFrom) > l.syntaxDepth+1 {
+				l.syntaxInFrom = l.syntaxInFrom[:l.syntaxDepth+1]
+			}
+		}
+		if len(l.tableParenStack) > 0 {
+			l.lastClosedTableParen = l.tableParenStack[len(l.tableParenStack)-1]
+			l.tableParenStack = l.tableParenStack[:len(l.tableParenStack)-1]
+		}
+	}
+	l.syntaxLastToken = token
+}
+
+func (l *Lexer) GetDbOrTblName(origin string) string {
+	if l.lower == 1 {
+		return tree.NewCStr(origin, l.lower).Compare()
+	}
+	return origin
+}
+
+func (l *Lexer) GetDbOrTblNameCStr(origin string) *tree.CStr {
+	return tree.NewCStr(origin, l.lower)
+}
+
+var CaseInsensitiveDbs = []string{"information_schema", "mysql"}
+
+func (l *Lexer) Error(err string) {
+	errMsg := fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MatrixOne server version for the right syntax to use. %s", err)
+	near := l.scanner.buf[l.scanner.PrePos:]
+	var lenStr string
+	if len(near) > 1024 {
+		lenStr = " (total length " + strconv.Itoa(len(lenStr)) + ")"
+		near = near[:commonutil.UTF8PrefixLen(near, 1024)]
+	}
+	near = commonutil.Abbreviate(near, -1)
+	l.scanner.LastError = PositionedErr{Err: errMsg, Line: l.scanner.Line, Col: l.scanner.Col, Near: near, LenStr: lenStr}
+}
+
+func (l *Lexer) AppendStmt(stmt tree.Statement) {
+	l.stmts = append(l.stmts, stmt)
+	if l.parseFirst && len(l.stmts) == 1 {
+		l.statementEnd = l.scanner.Pos
+		l.stopLexing = true
+	}
+}
+
+func (l *Lexer) AppendTopLevelSemicolon(end int) {
+	l.topLevelSemicolonEnds = append(l.topLevelSemicolonEnds, end)
+}
+
+func SplitSqlByStatement(ctx context.Context, sql string, lower int64) ([]string, error) {
+	return SplitSqlByStatementWithSQLMode(ctx, sql, lower, "")
+}
+
+func SplitSqlByStatementWithSQLMode(ctx context.Context, sql string, lower int64, sqlMode string) ([]string, error) {
+	lexer := NewLexerWithSQLMode(dialect.MYSQL, sql, lower, ParseSQLModeFlags(sqlMode))
+	defer PutScanner(lexer.scanner)
+	if yyParse(lexer) != 0 {
+		for _, stmt := range lexer.stmts {
+			stmt.Free()
+		}
+		return nil, lexer.scanner.LastError
+	}
+	if err := validateSelectIntoStatements(lexer); err != nil {
+		for _, stmt := range lexer.stmts {
+			stmt.Free()
+		}
+		return nil, err
+	}
+	defer func() {
+		for _, stmt := range lexer.stmts {
+			stmt.Free()
+		}
+	}()
+
+	// A MySQL executable comment is SQL lexical space, so a statement-ending
+	// semicolon can occur before the raw /*! ... */ wrapper closes. The parser
+	// records that semicolon's byte offset, but slicing there would turn one
+	// statement into two invalid raw fragments ("/*! ..." and "*/"). Extend
+	// only a comment's final semicolon through its terminator. Earlier
+	// semicolons, if any, remain genuine statement boundaries.
+	var executableCommentEnds map[int]int
+	if lexer.scanner.executableCommentEnd != 0 {
+		executableCommentEnds = executableCommentEndsByFinalSemicolon(sql, sqlMode)
+	}
+	fragments := make([]string, 0, len(lexer.topLevelSemicolonEnds)+1)
+	start := 0
+	for _, end := range lexer.topLevelSemicolonEnds {
+		fragmentEnd := end - 1
+		nextStart := end
+		if commentEnd, ok := executableCommentEnds[end]; ok {
+			fragmentEnd = commentEnd
+			nextStart = commentEnd
+		}
+		fragments = append(fragments, strings.TrimSpace(sql[start:fragmentEnd]))
+		start = nextStart
+	}
+	tail := strings.TrimSpace(sql[start:])
+	if len(lexer.topLevelSemicolonEnds) == 0 || tail != "" {
+		fragments = append(fragments, tail)
+	}
+	if len(fragments) == 0 {
+		return []string{""}, nil
+	}
+	return fragments, nil
+}
+
+// validateSelectIntoStatements is the final parser boundary for SELECT INTO
+// ownership.  Individual grammar productions validate their local shape, but
+// only after the complete statement is assembled can we see ON DUPLICATE,
+// RETURNING, EXPLAIN, and statement roots such as SET/DO/CALL/SHOW.
+func validateSelectIntoStatements(lexer *Lexer) error {
+	for _, stmt := range lexer.stmts {
+		if errMsg := tree.ValidateSelectIntoStatementRoot(stmt); errMsg != "" {
+			lexer.Error(errMsg)
+			return lexer.scanner.LastError
+		}
+	}
+	return nil
+}
+
+// executableCommentEndsByFinalSemicolon maps the final semicolon inside each
+// executable comment to the byte offset immediately after its closing */. The
+// scanner supplies both SQL-mode-aware tokenization and a terminator offset
+// that is not confused by comment-looking text inside quoted values.
+func executableCommentEndsByFinalSemicolon(sql string, sqlMode string) map[int]int {
+	scanner := NewScannerWithSQLMode(dialect.MYSQL, sql, ParseSQLModeFlags(sqlMode))
+	defer PutScanner(scanner)
+
+	var ends map[int]int
+	finalSemicolonEnd := 0
+	for {
+		typ, _ := scanner.Scan()
+		if commentEnd := scanner.TakeExecutableCommentEnd(); commentEnd != 0 {
+			if finalSemicolonEnd != 0 && commentEnd >= 2 && finalSemicolonEnd <= commentEnd-2 &&
+				strings.TrimSpace(sql[finalSemicolonEnd:commentEnd-2]) == "" {
+				if ends == nil {
+					ends = make(map[int]int)
+				}
+				ends[finalSemicolonEnd] = commentEnd
+			}
+			finalSemicolonEnd = 0
+		}
+		if typ == ';' && scanner.CommentFlag {
+			finalSemicolonEnd = scanner.Pos
+		}
+		if typ == 0 || typ == EofChar() || typ == LEX_ERROR {
+			break
+		}
+	}
+	return ends
+}
+
+func (l *Lexer) toInt(lval *yySymType, str string) int {
+	ival, err := strconv.ParseUint(str, 10, 64)
+	if err != nil {
+		// TODO: toDecimal()
+		// l.scanner.LastError = err
+		lval.str = str
+		return DECIMAL_VALUE
+	}
+	switch {
+	case ival <= math.MaxInt64:
+		lval.item = int64(ival)
+	default:
+		lval.item = ival
+	}
+	lval.str = str
+	return INTEGRAL
+}
+
+func (l *Lexer) toFloat(lval *yySymType, str string) int {
+	fval, err := strconv.ParseFloat(str, 64)
+	if err != nil {
+		l.scanner.LastError = err
+		return LEX_ERROR
+	}
+	lval.item = fval
+	return FLOAT
+}

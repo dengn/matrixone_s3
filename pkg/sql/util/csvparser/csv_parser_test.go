@@ -1,0 +1,739 @@
+// Copyright 2020 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package csvparser
+
+import (
+	"fmt"
+	"io"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+// TODO: rewrite test case
+
+func NewStringReader(str string) io.Reader {
+	return strings.NewReader(str)
+}
+
+func newStringField(val string, isNull bool, hasStringQuote bool) Field {
+	return Field{
+		Val:            val,
+		IsNull:         isNull,
+		HasStringQuote: hasStringQuote,
+	}
+}
+func assertPosEqual(t *testing.T, parser *CSVParser, pos int64) {
+	require.Equal(t, parser.Pos(), pos)
+}
+func tpchDatums() [][]Field {
+	datums := make([][]Field, 0, 3)
+	datums = append(datums, []Field{
+		newStringField("1", false, false),
+		newStringField("goldenrod lavender spring chocolate lace", false, false),
+		newStringField("Manufacturer#1", false, false),
+		newStringField("Brand#13", false, false),
+		newStringField("PROMO BURNISHED COPPER", false, false),
+		newStringField("7", false, false),
+		newStringField("JUMBO PKG", false, false),
+		newStringField("901.00", false, false),
+		newStringField("ly. slyly ironi", false, false),
+	})
+	datums = append(datums, []Field{
+		newStringField("2", false, false),
+		newStringField("blush thistle blue yellow saddle", false, false),
+		newStringField("Manufacturer#1", false, false),
+		newStringField("Brand#13", false, false),
+		newStringField("LARGE BRUSHED BRASS", false, false),
+		newStringField("1", false, false),
+		newStringField("LG CASE", false, false),
+		newStringField("902.00", false, false),
+		newStringField("lar accounts amo", false, false),
+	})
+	datums = append(datums, []Field{
+		newStringField("3", false, false),
+		newStringField("spring green yellow purple cornsilk", false, false),
+		newStringField("Manufacturer#4", false, false),
+		newStringField("Brand#42", false, false),
+		newStringField("STANDARD POLISHED BRASS", false, false),
+		newStringField("21", false, false),
+		newStringField("WRAP CASE", false, false),
+		newStringField("903.00", false, false),
+		newStringField("egular deposits hag", false, false),
+	})
+
+	return datums
+}
+
+func datumsToString(datums [][]Field, delimitor string, quote string, lastSep bool) string {
+	var b strings.Builder
+	doubleQuote := quote + quote
+	for _, ds := range datums {
+		for i, d := range ds {
+			text := d.Val
+			if len(quote) > 0 {
+				b.WriteString(quote)
+				b.WriteString(strings.ReplaceAll(text, quote, doubleQuote))
+				b.WriteString(quote)
+			} else {
+				b.WriteString(text)
+			}
+			if lastSep || i < len(ds)-1 {
+				b.WriteString(delimitor)
+			}
+		}
+		b.WriteString("\r\n")
+	}
+	return b.String()
+}
+
+func TestTPCH(t *testing.T) {
+	datums := tpchDatums()
+	input := datumsToString(datums, "|", "", true)
+	reader := strings.NewReader(input)
+
+	cfg := CSVConfig{
+		FieldsTerminatedBy: "|",
+		FieldsEnclosedBy:   "",
+		TrimLastSep:        true,
+	}
+
+	parser, err := NewCSVParser(&cfg, reader, int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	var row []Field
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, datums[0], row)
+	require.Equal(t, parser.Pos(), int64(126))
+	assertPosEqual(t, parser, 126)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, datums[1], row)
+	assertPosEqual(t, parser, 241)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, datums[2], row)
+	assertPosEqual(t, parser, 369)
+
+}
+
+func TestTPCHMultiBytes(t *testing.T) {
+	datums := tpchDatums()
+	sepsAndQuotes := [][2]string{
+		{",", ""},
+		{"\000", ""},
+		{"，", ""},
+		{"🤔", ""},
+		{"，", "。"},
+		{"||", ""},
+		{"|+|", ""},
+		{"##", ""},
+		{"，", "'"},
+		{"，", `"`},
+		{"🤔", `''`},
+		{"🤔", `"'`},
+		{"🤔", `"'`},
+		{"🤔", "🌚"}, // this two emoji have same prefix bytes
+		{"##", "#-"},
+		{"\\s", "\\q"},
+		{",", "1"},
+		{",", "ac"},
+	}
+	for _, SepAndQuote := range sepsAndQuotes {
+		inputStr := datumsToString(datums, SepAndQuote[0], SepAndQuote[1], false)
+
+		// extract all index in the middle of '\r\n' from the inputStr.
+		// they indicate where the parser stops after reading one row.
+		// should be equals to the number of datums.
+		var allExpectedParserPos []int
+		for {
+			last := 0
+			if len(allExpectedParserPos) > 0 {
+				last = allExpectedParserPos[len(allExpectedParserPos)-1]
+			}
+			pos := strings.IndexByte(inputStr[last:], '\r')
+			if pos < 0 {
+				break
+			}
+			allExpectedParserPos = append(allExpectedParserPos, last+pos+1)
+		}
+		require.Len(t, allExpectedParserPos, len(datums))
+
+		cfg := CSVConfig{
+			FieldsTerminatedBy: SepAndQuote[0],
+			FieldsEnclosedBy:   SepAndQuote[1],
+			TrimLastSep:        false,
+		}
+
+		reader := NewStringReader(inputStr)
+		parser, err := NewCSVParser(&cfg, reader, int64(ReadBlockSize), false)
+		if fmt.Sprint(err) == "invalid input: invalid field delimiter" {
+			continue
+		}
+		require.NoError(t, err)
+
+		for i, expectedParserPos := range allExpectedParserPos {
+			row, err := parser.Read(nil)
+			require.Nil(t, err)
+			require.Equal(t, len(datums[i]), len(row))
+			for j := range row {
+				require.Equal(t, datums[i][j].Val, row[j].Val)
+				require.Equal(t, datums[i][j].IsNull, row[j].IsNull)
+			}
+			assertPosEqual(t, parser, int64(expectedParserPos))
+		}
+
+	}
+}
+
+func TestLinesTerminatedBy(t *testing.T) {
+	datums := tpchDatums()
+	input := datumsToString(datums, "|", "", true)
+	reader := strings.NewReader(input)
+
+	cfg := CSVConfig{
+		FieldsTerminatedBy: "|",
+		FieldsEnclosedBy:   "",
+		LinesTerminatedBy:  "\r\n",
+		TrimLastSep:        true,
+	}
+
+	parser, err := NewCSVParser(&cfg, reader, int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	var row []Field
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, datums[0], row)
+	require.Equal(t, parser.Pos(), int64(127))
+	assertPosEqual(t, parser, 127)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, datums[1], row)
+	assertPosEqual(t, parser, 242)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, datums[2], row)
+	assertPosEqual(t, parser, 370)
+
+}
+
+func TestRFC4180(t *testing.T) {
+	cfg := CSVConfig{
+		FieldsTerminatedBy: ",",
+		FieldsEnclosedBy:   `"`,
+	}
+
+	// example 1, trailing new lines
+
+	parser, err := NewCSVParser(&cfg, NewStringReader("aaa,bbb,ccc\nzzz,yyy,xxx\n"), int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	var row []Field
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, []Field{
+		newStringField("aaa", false, false),
+		newStringField("bbb", false, false),
+		newStringField("ccc", false, false),
+	}, row)
+	assertPosEqual(t, parser, 12)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, []Field{
+		newStringField("zzz", false, false),
+		newStringField("yyy", false, false),
+		newStringField("xxx", false, false),
+	}, row)
+	assertPosEqual(t, parser, 24)
+
+	// example 2, no trailing new lines
+
+	parser, err = NewCSVParser(&cfg, NewStringReader("aaa,bbb,ccc\nzzz,yyy,xxx"), int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, []Field{
+		newStringField("aaa", false, false),
+		newStringField("bbb", false, false),
+		newStringField("ccc", false, false),
+	}, row)
+	assertPosEqual(t, parser, 12)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, []Field{
+		newStringField("zzz", false, false),
+		newStringField("yyy", false, false),
+		newStringField("xxx", false, false),
+	}, row)
+	assertPosEqual(t, parser, 23)
+
+	// example 5, quoted fields
+
+	parser, err = NewCSVParser(&cfg, NewStringReader(`"aaa","bbb","ccc"`+"\nzzz,yyy,xxx"), int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, []Field{
+		newStringField("aaa", false, true),
+		newStringField("bbb", false, true),
+		newStringField("ccc", false, true),
+	}, row)
+	assertPosEqual(t, parser, 18)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, []Field{
+		newStringField("zzz", false, false),
+		newStringField("yyy", false, false),
+		newStringField("xxx", false, false),
+	}, row)
+	assertPosEqual(t, parser, 29)
+
+	// example 6, line breaks within fields
+
+	parser, err = NewCSVParser(&cfg, NewStringReader(`"aaa","b
+bb","ccc"
+zzz,yyy,xxx`), int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, []Field{
+		newStringField("aaa", false, true),
+		newStringField("b\nbb", false, true),
+		newStringField("ccc", false, true),
+	}, row)
+	assertPosEqual(t, parser, 19)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, []Field{
+		newStringField("zzz", false, false),
+		newStringField("yyy", false, false),
+		newStringField("xxx", false, false),
+	}, row)
+	assertPosEqual(t, parser, 30)
+
+	// example 7, quote escaping
+
+	parser, err = NewCSVParser(&cfg, NewStringReader(`"aaa","b""bb","ccc"`), int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, []Field{
+		newStringField("aaa", false, true),
+		newStringField("b\"bb", false, true),
+		newStringField("ccc", false, true),
+	}, row)
+	assertPosEqual(t, parser, 19)
+
+	//  example 8, read head columns
+	parser, err = NewCSVParser(&cfg, NewStringReader(`"aaa","bbb","ccc"`+"\nzzz,yyy,xxx"), int64(ReadBlockSize), true)
+	require.NoError(t, err)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, 0, len(parser.columns))
+	require.Equal(t, []Field{
+		newStringField("zzz", false, false),
+		newStringField("yyy", false, false),
+		newStringField("xxx", false, false),
+	}, row)
+
+	cfg.HeaderSchemaMatch = true
+	parser, err = NewCSVParser(&cfg, NewStringReader(`"aaa","bbb","ccc"`+"\nzzz,yyy,xxx"), int64(ReadBlockSize), true)
+	require.NoError(t, err)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, []string{"aaa", "bbb", "ccc"}, parser.columns)
+	require.Equal(t, []Field{
+		newStringField("zzz", false, false),
+		newStringField("yyy", false, false),
+		newStringField("xxx", false, false),
+	}, row)
+
+}
+
+func TestMySQL(t *testing.T) {
+	cfg := CSVConfig{
+		FieldsTerminatedBy: ",",
+		FieldsEnclosedBy:   `"`,
+		LinesTerminatedBy:  "\n",
+		FieldsEscapedBy:    `\`,
+		NotNull:            false,
+		Null:               []string{`\N`},
+	}
+
+	parser, err := NewCSVParser(&cfg, NewStringReader(`"\"","\\","\?"
+"\
+",\N,\\N`), int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	var row []Field
+
+	row, err = parser.Read(nil)
+	require.NoError(t, err)
+	require.Equal(t, []Field{
+		newStringField(`"`, false, true),
+		newStringField(`\`, false, true),
+		newStringField("?", false, true),
+	}, row)
+
+	assertPosEqual(t, parser, 15)
+
+	row, err = parser.Read(nil)
+	require.NoError(t, err)
+
+	require.Equal(t, []Field{
+		newStringField("\n", false, true),
+		newStringField("\\N", true, false),
+		newStringField(`\N`, false, false),
+	}, row)
+
+	assertPosEqual(t, parser, 26)
+
+	parser, err = NewCSVParser(
+		&cfg,
+		NewStringReader(`"\0\b\n\r\t\Z\\\  \c\'\""`),
+		int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	row, err = parser.Read(nil)
+	require.NoError(t, err)
+	require.Equal(t, []Field{
+		newStringField(string([]byte{0, '\b', '\n', '\r', '\t', 26, '\\', ' ', ' ', 'c', '\'', '"'}), false, true),
+	}, row)
+
+	cfg.UnescapedQuote = true
+	parser, err = NewCSVParser(
+		&cfg,
+		NewStringReader(`3,"a string containing a " quote",102.20
+`),
+		int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	row, err = parser.Read(nil)
+	require.NoError(t, err)
+	require.Equal(t, []Field{
+		newStringField("3", false, false),
+		newStringField(`a string containing a " quote`, false, true),
+		newStringField("102.20", false, false),
+	}, row)
+
+	parser, err = NewCSVParser(
+		&cfg,
+		NewStringReader(`3,"a string containing a " quote","102.20"`),
+		int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	row, err = parser.Read(nil)
+	require.NoError(t, err)
+	require.Equal(t, []Field{
+		newStringField("3", false, false),
+		newStringField(`a string containing a " quote`, false, true),
+		newStringField("102.20", false, true),
+	}, row)
+
+	parser, err = NewCSVParser(
+		&cfg,
+		NewStringReader(`"a"b",c"d"e`),
+		int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	row, err = parser.Read(nil)
+	require.NoError(t, err)
+	require.Equal(t, []Field{
+		newStringField(`a"b`, false, true),
+		newStringField(`c"d"e`, false, false),
+	}, row)
+}
+
+func TestCustomEscapeChar(t *testing.T) {
+	cfg := CSVConfig{
+		FieldsTerminatedBy: ",",
+		FieldsEnclosedBy:   `"`,
+		FieldsEscapedBy:    `!`,
+		NotNull:            false,
+		Null:               []string{`!N`},
+	}
+
+	parser, err := NewCSVParser(&cfg, NewStringReader(`"!"","!!","!\"
+"!
+",!N,!!N`), int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	var row []Field
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, []Field{
+		newStringField(`"`, false, true),
+		newStringField(`!`, false, true),
+		newStringField(`\`, false, true),
+	}, row)
+	assertPosEqual(t, parser, 15)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, []Field{
+		newStringField("\n", false, true),
+		newStringField(`!N`, true, false),
+		newStringField(`!N`, false, false),
+	}, row)
+	assertPosEqual(t, parser, 26)
+
+	cfg = CSVConfig{
+		FieldsTerminatedBy: ",",
+		FieldsEnclosedBy:   `"`,
+		FieldsEscapedBy:    ``,
+		NotNull:            false,
+		Null:               []string{`NULL`},
+	}
+
+	parser, err = NewCSVParser(
+		&cfg,
+		NewStringReader(`"{""itemRangeType"":0,""itemContainType"":0,""shopRangeType"":1,""shopJson"":""[{\""id\"":\""A1234\"",\""shopName\"":\""AAAAAA\""}]""}"`),
+		int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	row, err = parser.Read(nil)
+	require.Nil(t, err)
+	require.Equal(t, []Field{
+		newStringField(`{"itemRangeType":0,"itemContainType":0,"shopRangeType":1,"shopJson":"[{\"id\":\"A1234\",\"shopName\":\"AAAAAA\"}]"}`, false, true),
+	}, row)
+}
+
+// TestCommentEmptyRecordNoPanic: an all-empty-string row (e.g. `""\n` or
+// `"",""\n`) leaves recordBuffer empty; the comment check must not index
+// recordBuffer[0] out of range.
+func TestCommentEmptyRecordNoPanic(t *testing.T) {
+	cfg := CSVConfig{
+		FieldsTerminatedBy: ",",
+		FieldsEnclosedBy:   `"`,
+		Comment:            "#",
+	}
+	parser, err := NewCSVParser(&cfg, NewStringReader("\"\",\"\"\n1,2\n"), int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	row, err := parser.Read(nil)
+	require.NoError(t, err)
+	require.Len(t, row, 2)
+	require.Equal(t, "", row[0].Val)
+	require.Equal(t, "", row[1].Val)
+
+	row, err = parser.Read(nil)
+	require.NoError(t, err)
+	require.Equal(t, "1", row[0].Val)
+	require.Equal(t, "2", row[1].Val)
+}
+
+// TestCommentDisabled: with no comment marker (empty Comment, the default), a
+// first field starting with '#' is data, not a skipped comment.
+func TestCommentDisabled(t *testing.T) {
+	cfg := CSVConfig{FieldsTerminatedBy: ",", FieldsEnclosedBy: `"`} // Comment == ""
+	parser, err := NewCSVParser(&cfg, NewStringReader("#lost,1\nkept,2\n"), int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	row, err := parser.Read(nil)
+	require.NoError(t, err)
+	require.Equal(t, "#lost", row[0].Val)
+	require.Equal(t, "1", row[1].Val)
+}
+
+// TestCommentRawFirstByte: the comment marker is matched on the line's first
+// RAW byte (before unquoting). An enclosed "#x" value begins with the quote
+// char, so it is data; only an unquoted line literally starting with '#' is a
+// skipped comment.
+func TestCommentRawFirstByte(t *testing.T) {
+	cfg := CSVConfig{FieldsTerminatedBy: ",", FieldsEnclosedBy: `"`, Comment: "#"}
+	parser, err := NewCSVParser(&cfg,
+		NewStringReader("\"#x\",1\n# a real comment\nkept,2\n"),
+		int64(ReadBlockSize), false)
+	require.NoError(t, err)
+
+	// quoted "#x" is data, not a comment
+	row, err := parser.Read(nil)
+	require.NoError(t, err)
+	require.Equal(t, "#x", row[0].Val)
+	require.Equal(t, "1", row[1].Val)
+
+	// the unquoted '# a real comment' line is skipped; the next data row follows
+	row, err = parser.Read(nil)
+	require.NoError(t, err)
+	require.Equal(t, "kept", row[0].Val)
+	require.Equal(t, "2", row[1].Val)
+
+	_, err = parser.Read(nil)
+	require.ErrorIs(t, err, io.EOF)
+}
+
+// TestParserReset: one parser reused across independent inputs must show no
+// cross-input bleed — including after a partial/failed read — and must keep
+// its configuration.
+func TestParserReset(t *testing.T) {
+	cfg := &CSVConfig{
+		FieldsTerminatedBy: ",",
+		FieldsEnclosedBy:   `"`,
+		LinesTerminatedBy:  "\n",
+	}
+	parser, err := NewCSVParser(cfg, strings.NewReader(""), ReadBlockSize, false)
+	require.NoError(t, err)
+
+	readOne := func(input string) ([]Field, error) {
+		parser.Reset(strings.NewReader(input))
+		return parser.Read(nil)
+	}
+
+	row, err := readOne("a,b,c")
+	require.NoError(t, err)
+	require.Len(t, row, 3)
+	require.Equal(t, "a", row[0].Val)
+
+	// an unterminated quoted field fails; the NEXT input must be clean
+	_, err = readOne(`"unterminated`)
+	require.Error(t, err)
+	row, err = readOne("x,y")
+	require.NoError(t, err)
+	require.Len(t, row, 2)
+	require.Equal(t, "x", row[0].Val)
+	require.Equal(t, "y", row[1].Val)
+
+	// leftover unread content of a previous input never bleeds into the next
+	row, err = readOne("1,2\n3,4\n5,6")
+	require.NoError(t, err)
+	require.Equal(t, "1", row[0].Val)
+	row, err = readOne("7,8")
+	require.NoError(t, err)
+	require.Equal(t, "7", row[0].Val)
+	require.Equal(t, "8", row[1].Val)
+	_, err = parser.Read(nil)
+	require.ErrorIs(t, err, io.EOF)
+}
+
+// RecordLine reports the physical line a record starts on, which is what an
+// external scan surfaces as __mo_file_line. A record whose quoted field spans
+// several lines must report its FIRST line, and the counter must survive
+// records that are read across buffer refills.
+func TestRecordLine(t *testing.T) {
+	cfg := CSVConfig{
+		FieldsTerminatedBy: ",",
+		FieldsEnclosedBy:   `"`,
+	}
+
+	t.Run("one record per line", func(t *testing.T) {
+		parser, err := NewCSVParser(&cfg, NewStringReader("a,1\nb,2\nc,3\n"), int64(ReadBlockSize), false)
+		require.NoError(t, err)
+		for _, want := range []int64{1, 2, 3} {
+			_, err = parser.Read(nil)
+			require.NoError(t, err)
+			require.Equal(t, want, parser.RecordLine())
+		}
+	})
+
+	t.Run("multi-line quoted field reports its first line", func(t *testing.T) {
+		// line 1: a,"x            line 4: c,3
+		// lines 2-3 are inside the quoted field
+		parser, err := NewCSVParser(&cfg, NewStringReader("a,\"x\ny\nz\"\nc,3\n"), int64(ReadBlockSize), false)
+		require.NoError(t, err)
+
+		_, err = parser.Read(nil)
+		require.NoError(t, err)
+		require.Equal(t, int64(1), parser.RecordLine(), "record starting on line 1 spans lines 1-3")
+
+		_, err = parser.Read(nil)
+		require.NoError(t, err)
+		require.Equal(t, int64(4), parser.RecordLine(), "the next record starts on line 4")
+	})
+
+	t.Run("skipped blank lines still count", func(t *testing.T) {
+		// line 1: a,1   lines 2-3 blank   line 4: b,2   line 5 whitespace
+		// line 6: c,3 -- a record starts where its content starts, not where
+		// the scan for it started.
+		parser, err := NewCSVParser(&cfg, NewStringReader("a,1\n\n\nb,2\n   \nc,3\n"), int64(ReadBlockSize), false)
+		require.NoError(t, err)
+		for _, want := range []int64{1, 4, 6} {
+			_, err = parser.Read(nil)
+			require.NoError(t, err)
+			require.Equal(t, want, parser.RecordLine())
+		}
+	})
+
+	// A quoted field spanning more bytes than one read block drains several
+	// blocks into the record. Counting only the last block's prefix loses every
+	// newline in the blocks before it -- which is exactly the record shape
+	// __mo_file_line exists to report.
+	t.Run("newlines are counted in every drained block", func(t *testing.T) {
+		parser, err := NewCSVParser(&cfg,
+			NewStringReader("a,\"xxxxxxxx\nxxxxxxxx\nxxxxxxxx\"\nb,2\n"), 4, false)
+		require.NoError(t, err)
+
+		_, err = parser.Read(nil)
+		require.NoError(t, err)
+		require.Equal(t, int64(1), parser.RecordLine(), "the quoted record starts on line 1")
+
+		_, err = parser.Read(nil)
+		require.NoError(t, err)
+		require.Equal(t, int64(4), parser.RecordLine(),
+			"the quoted field spans lines 1-3, so the next record is on line 4")
+	})
+
+	// LINES STARTING BY reads ahead a whole line, then pushes the unmatched
+	// remainder back and rewinds pos. The counter has to rewind with it, or the
+	// newline consumed by the lookahead is counted twice.
+	t.Run("lines starting by does not double count", func(t *testing.T) {
+		startCfg := cfg
+		startCfg.LinesStartingBy = "xxx"
+		startCfg.LinesTerminatedBy = "\n"
+		parser, err := NewCSVParser(&startCfg, NewStringReader("xxxa,1\nxxxb,2\n"), int64(ReadBlockSize), false)
+		require.NoError(t, err)
+		for _, want := range []int64{1, 2} {
+			_, err = parser.Read(nil)
+			require.NoError(t, err)
+			require.Equal(t, want, parser.RecordLine())
+		}
+	})
+
+	t.Run("counter is exact across a small read block", func(t *testing.T) {
+		// a tiny block size forces the refill paths (readUntil's loop) that
+		// advance position in bulk rather than byte by byte
+		var sb strings.Builder
+		for i := 0; i < 50; i++ {
+			sb.WriteString("aaaaaaaaaa,bbbbbbbbbb\n")
+		}
+		parser, err := NewCSVParser(&cfg, NewStringReader(sb.String()), 8, false)
+		require.NoError(t, err)
+		for i := int64(1); i <= 50; i++ {
+			_, err = parser.Read(nil)
+			require.NoError(t, err)
+			require.Equal(t, i, parser.RecordLine(), "record %d", i)
+		}
+	})
+}

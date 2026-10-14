@@ -1,0 +1,388 @@
+// Copyright 2022 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package plan
+
+import (
+	"strconv"
+	"strings"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+)
+
+func normalizeGroupByName(name *tree.UnresolvedName) {
+	for i := 0; i < name.NumParts; i++ {
+		if name.CStrParts[i] != nil {
+			name.CStrParts[i] = tree.NewCStr(name.CStrParts[i].Compare(), 0)
+		}
+	}
+}
+
+// canonicalGroupByAstKey folds identifiers and function names through their
+// comparison form. Resolved columns are represented by relation tag and column
+// position, so col, tbl.col, and db.tbl.col match only when they resolve to the
+// same source column. String literals and all other case-sensitive values retain
+// their original spelling.
+func canonicalGroupByAstKey(ctx *BindContext, astExpr tree.Expr) string {
+	normalized := cloneTreeExpr(astExpr)
+	var resolvedColumns strings.Builder
+	functionNames := make(map[*tree.UnresolvedName]struct{})
+	walkGroupingSetOrderByExpr(normalized, func(expr tree.Expr) bool {
+		switch node := expr.(type) {
+		case *tree.UnresolvedName:
+			normalizeGroupByName(node)
+			if _, isFunctionName := functionNames[node]; isFunctionName {
+				return true
+			}
+			if binding, colPos, ok := resolveColumnIdentity(ctx, node); ok {
+				node.NumParts = 1
+				node.CStrParts = tree.CStrParts{}
+				node.CStrParts[0] = tree.NewCStr("__mo_resolved_group_by_column", 0)
+				resolvedColumns.WriteByte('#')
+				resolvedColumns.WriteString(strconv.FormatInt(int64(binding.tag), 10))
+				resolvedColumns.WriteByte(':')
+				resolvedColumns.WriteString(strconv.FormatInt(int64(colPos), 10))
+				resolvedColumns.WriteByte(';')
+			}
+		case *tree.FuncExpr:
+			if node.FuncName != nil {
+				node.FuncName = tree.NewCStr(node.FuncName.Compare(), 0)
+			}
+			if name, ok := node.Func.FunctionReference.(*tree.UnresolvedName); ok {
+				normalizeGroupByName(name)
+				functionNames[name] = struct{}{}
+			}
+		}
+		return true
+	})
+	return semanticAstKey(normalized) + "\x00resolved-columns" + resolvedColumns.String()
+}
+
+func lookupGroupByAst(ctx *BindContext, astExpr tree.Expr, astKey string) (int32, bool) {
+	if pos, ok := ctx.groupByAst[astKey]; ok {
+		return pos, true
+	}
+	if len(ctx.groupByCanonicalAst) == 0 {
+		return 0, false
+	}
+	pos, ok := ctx.groupByCanonicalAst[canonicalGroupByAstKey(ctx, astExpr)]
+	return pos, ok
+}
+
+// elideStableLiteralGroupBy removes direct, plan-stable literals when another
+// grouping expression remains. Such a literal cannot split an input equivalence
+// class, and leaving it registered as a group result forces every aggregate
+// stage to materialize the same value once per group. Removing its registry
+// entries makes HAVING/projection bind the original literal directly instead.
+//
+// Keep all-literal grouping intact: on empty input GROUP BY constants returns no
+// rows, while a scalar aggregate returns one row. Literal.Src is also retained
+// because prepared/runtime specialization can restore a dynamic expression.
+func elideStableLiteralGroupBy(ctx *BindContext) {
+	if ctx == nil || len(ctx.groups) < 2 ||
+		(len(ctx.groupingFlag) != 0 && len(ctx.groupingFlag) != len(ctx.groups)) {
+		return
+	}
+
+	stableLiteralCount := 0
+	for _, expr := range ctx.groups {
+		if expr == nil {
+			return
+		}
+		literal := expr.GetLit()
+		if literal != nil && literal.Src == nil {
+			stableLiteralCount++
+		}
+	}
+	if stableLiteralCount == 0 || stableLiteralCount == len(ctx.groups) ||
+		!validGroupByPositions(ctx.groupByAst, len(ctx.groups)) ||
+		!validGroupByPositions(ctx.groupByCanonicalAst, len(ctx.groups)) ||
+		!validGroupByPositions(ctx.groupByParamAst, len(ctx.groups)) {
+		return
+	}
+
+	oldToNew := make([]int32, len(ctx.groups))
+	groups := make([]*plan.Expr, 0, len(ctx.groups)-stableLiteralCount)
+	for i, expr := range ctx.groups {
+		literal := expr.GetLit()
+		if literal != nil && literal.Src == nil {
+			oldToNew[i] = -1
+			continue
+		}
+		oldToNew[i] = int32(len(groups))
+		groups = append(groups, expr)
+	}
+
+	ctx.groups = groups
+	if len(ctx.groupingFlag) > 0 {
+		flags := make([]bool, 0, len(groups))
+		for i, flag := range ctx.groupingFlag {
+			if oldToNew[i] >= 0 {
+				flags = append(flags, flag)
+			}
+		}
+		ctx.groupingFlag = flags
+	}
+	remapElidedGroupByPositions(ctx.groupByAst, oldToNew)
+	remapElidedGroupByPositions(ctx.groupByCanonicalAst, oldToNew)
+	remapElidedGroupByPositions(ctx.groupByParamAst, oldToNew)
+}
+
+// preserveElidedGroupByForSample remembers only logical GROUP BY identities
+// removed from the physical key. The ordinary bind registries must stay
+// reduced so projection, HAVING, and ORDER BY bind stable literals directly;
+// SAMPLE has the stricter rule that it cannot consume any logical group key.
+func preserveElidedGroupByForSample(ctx *BindContext, logicalGroupByAst map[string]int32) {
+	if ctx == nil {
+		return
+	}
+	for key := range logicalGroupByAst {
+		if _, retained := ctx.groupByAst[key]; retained {
+			continue
+		}
+		if ctx.sampleGroupByAst == nil {
+			ctx.sampleGroupByAst = make(map[string]struct{})
+		}
+		ctx.sampleGroupByAst[key] = struct{}{}
+	}
+}
+
+func validGroupByPositions(positions map[string]int32, groupCount int) bool {
+	for _, position := range positions {
+		if position < 0 || int(position) >= groupCount {
+			return false
+		}
+	}
+	return true
+}
+
+func remapElidedGroupByPositions(positions map[string]int32, oldToNew []int32) {
+	for key, old := range positions {
+		if old < 0 || int(old) >= len(oldToNew) || oldToNew[old] < 0 {
+			delete(positions, key)
+			continue
+		}
+		positions[key] = oldToNew[old]
+	}
+}
+
+func NewGroupBinder(
+	builder *QueryBuilder,
+	ctx *BindContext,
+	selectList tree.SelectExprs,
+	allowScalarSubquery bool,
+) *GroupBinder {
+	b := &GroupBinder{allowScalarSubquery: allowScalarSubquery}
+	b.sysCtx = builder.GetContext()
+	b.builder = builder
+	b.ctx = ctx
+	b.impl = b
+	b.selectList = selectList
+	b.projectionExprPos = -1
+
+	return b
+}
+
+func (b *GroupBinder) BindExpr(astExpr tree.Expr, depth int32, isRoot bool) (*plan.Expr, error) {
+	var numericTarget *plan.Type
+	reusesProjection := false
+	if isRoot && b.projectionExprPos >= 0 {
+		pos := b.projectionExprPos
+		astExpr = b.selectList[pos].Expr
+		reusesProjection = true
+		if int(pos) < len(b.ctx.numericProjectionTypes) {
+			target := b.ctx.numericProjectionTypes[pos]
+			if isNumericAssignmentTarget(target) {
+				numericTarget = &target
+			}
+		}
+	}
+	// An alias has already selected and substituted its projection expression.
+	// Do not interpret a numeric literal inside that expression as an ordinal a
+	// second time.
+	if isRoot && !reusesProjection {
+		if numVal, ok := astExpr.(*tree.NumVal); ok {
+			switch numVal.Kind() {
+			case tree.Int:
+				reusesProjection = true
+				colPos, _ := numVal.Int64()
+				if colPos < 1 || int(colPos) > len(b.selectList) {
+					return nil, moerr.NewSyntaxErrorf(b.GetContext(), "GROUP BY position %v is not in select list", colPos)
+				}
+
+				astExpr = b.selectList[colPos-1].Expr
+				if int(colPos) <= len(b.ctx.numericProjectionTypes) {
+					target := b.ctx.numericProjectionTypes[colPos-1]
+					if isNumericAssignmentTarget(target) {
+						numericTarget = &target
+					}
+				}
+
+			case tree.Unknown:
+				if numVal.ValType != tree.P_null {
+					return nil, moerr.NewSyntaxError(b.GetContext(), "non-integer constant in GROUP BY")
+				}
+
+			default:
+				return nil, moerr.NewSyntaxError(b.GetContext(), "non-integer constant in GROUP BY")
+			}
+		}
+	}
+
+	var expr *plan.Expr
+	var err error
+	if numericTarget != nil {
+		expr, err = b.bindNumericExprWithContext(astExpr, depth, numericTarget)
+	} else {
+		expr, err = b.baseBindExpr(astExpr, depth, isRoot)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if isRoot {
+		if err = rejectStandaloneIntervalExpr(b.GetContext(), expr, "GROUP BY"); err != nil {
+			return nil, err
+		}
+	}
+
+	if isRoot && !b.ctx.isGroupingSet {
+		astStr := semanticAstKey(astExpr)
+		// Independently written prepared expressions have different parameter
+		// identities even when their formatted SQL is identical. Ordinal and alias
+		// GROUP BY references are guaranteed to reuse the SELECT expression itself.
+		hasParam := containsDynamicParam(expr)
+		registerAst := reusesProjection || !hasParam
+		if registerAst {
+			if _, ok := b.ctx.groupByAst[astStr]; ok {
+				return nil, nil
+			}
+			pos := int32(len(b.ctx.groups))
+			b.ctx.groupByAst[astStr] = pos
+			canonicalKey := canonicalGroupByAstKey(b.ctx, astExpr)
+			if _, ok := b.ctx.groupByCanonicalAst[canonicalKey]; !ok {
+				b.ctx.groupByCanonicalAst[canonicalKey] = pos
+			}
+		}
+		if hasParam {
+			key := parameterizedGroupByKey(astStr, expr)
+			if _, ok := b.ctx.groupByParamAst[key]; ok {
+				return nil, nil
+			}
+			b.ctx.groupByParamAst[key] = int32(len(b.ctx.groups))
+		}
+		if !registerAst {
+			b.ctx.groups = append(b.ctx.groups, expr)
+			return nil, nil
+		}
+		b.ctx.groups = append(b.ctx.groups, expr)
+	}
+
+	if isRoot && b.ctx.isGroupingSet {
+		astStr := semanticAstKey(astExpr)
+		pos, ok := lookupGroupByAst(b.ctx, astExpr, astStr)
+		if containsDynamicParam(expr) {
+			pos, ok = b.ctx.groupByParamAst[parameterizedGroupByKey(astStr, expr)]
+		}
+		if !ok || int(pos) >= len(b.ctx.groupingFlag) {
+			return nil, moerr.NewInternalErrorf(b.GetContext(), "grouping expression position not found: %s", astStr)
+		}
+		b.ctx.groupingFlag[pos] = true
+	}
+
+	return expr, err
+}
+
+func parameterizedGroupByKey(ast string, expr *plan.Expr) string {
+	positions := make([]int32, 0, 2)
+	collectGroupByParamPositions(expr, &positions)
+	var key strings.Builder
+	key.WriteString(ast)
+	for _, pos := range positions {
+		key.WriteByte('#')
+		key.WriteString(strconv.FormatInt(int64(pos), 10))
+	}
+	return key.String()
+}
+
+func collectGroupByParamPositions(expr *plan.Expr, positions *[]int32) {
+	if expr == nil {
+		return
+	}
+	switch item := expr.Expr.(type) {
+	case *plan.Expr_P:
+		*positions = append(*positions, item.P.Pos)
+	case *plan.Expr_F:
+		for _, arg := range item.F.Args {
+			collectGroupByParamPositions(arg, positions)
+		}
+	}
+}
+
+func (b *GroupBinder) BindProjectionExpr(pos int32) (*plan.Expr, error) {
+	b.projectionExprPos = pos
+	defer func() { b.projectionExprPos = -1 }()
+	return b.BindExpr(b.selectList[pos].Expr, 0, true)
+}
+
+func (b *GroupBinder) BindColRef(astExpr *tree.UnresolvedName, depth int32, isRoot bool) (*plan.Expr, error) {
+	expr, err := b.baseBindColRef(astExpr, depth, isRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, ok := expr.Expr.(*plan.Expr_Corr); ok {
+		return nil, moerr.NewNYI(b.GetContext(), "correlated columns in GROUP BY clause")
+	}
+
+	return expr, nil
+}
+
+func (b *GroupBinder) BindAggFunc(funcName string, astExpr *tree.FuncExpr, depth int32, isRoot bool) (*plan.Expr, error) {
+	return nil, moerr.NewInvalidInput(b.GetContext(), "GROUP BY clause cannot contain aggregate functions")
+}
+
+func (b *GroupBinder) BindWinFunc(funcName string, astExpr *tree.FuncExpr, depth int32, isRoot bool) (*plan.Expr, error) {
+	return nil, moerr.NewInvalidInput(b.GetContext(), "GROUP BY clause cannot contain window functions")
+}
+
+func (b *GroupBinder) BindSubquery(astExpr *tree.Subquery, isRoot bool) (*plan.Expr, error) {
+	if !b.allowScalarSubquery || astExpr.Exists {
+		return nil, moerr.NewNYI(b.GetContext(), "subquery in GROUP BY clause")
+	}
+	expr, err := b.baseBindSubquery(astExpr, isRoot)
+	if err != nil {
+		return nil, err
+	}
+	subquery := expr.GetSub()
+	if subquery == nil {
+		return nil, moerr.NewInternalError(b.GetContext(), "GROUP BY scalar subquery has no expression")
+	}
+	if subquery.RowSize != 1 {
+		return nil, moerr.NewInvalidInput(b.GetContext(), "subquery returns more than 1 column")
+	}
+	if subquery.NodeId < 0 || int(subquery.NodeId) >= len(b.builder.ctxByNode) ||
+		b.builder.ctxByNode[subquery.NodeId] == nil {
+		return nil, moerr.NewInternalError(b.GetContext(), "GROUP BY scalar subquery has no bind context")
+	}
+	if b.builder.ctxByNode[subquery.NodeId].isCorrelated {
+		return nil, moerr.NewNYI(b.GetContext(), "correlated subquery in GROUP BY clause")
+	}
+	return expr, nil
+}
+
+func (b *GroupBinder) BindTimeWindowFunc(funcName string, astExpr *tree.FuncExpr, depth int32, isRoot bool) (*plan.Expr, error) {
+	return nil, moerr.NewInvalidInputf(b.GetContext(), "cannot bind time window functions '%s'", funcName)
+}

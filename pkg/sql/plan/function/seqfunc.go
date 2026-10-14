@@ -1,0 +1,701 @@
+// Copyright 2021 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package function
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/runtime"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/defines"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/function/functionUtil"
+	"github.com/matrixorigin/matrixone/pkg/txn/client"
+	"github.com/matrixorigin/matrixone/pkg/util/executor"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine"
+	"github.com/matrixorigin/matrixone/pkg/vm/process"
+	"golang.org/x/exp/constraints"
+)
+
+// Sequence writes belong to the caller's transaction. Nested SQL must not
+// retry that transaction's statement: only the outer compiler owns its
+// workspace rollback and cancellation of running SQL.
+
+// seq function tests are not ported.  mock table and txn are simply too much.
+// we rely on bvt for sequence function tests.
+
+var setEdge = true
+
+func sequenceSQL(proc *process.Process, db, sql string) ([][]interface{}, error) {
+	if proc.GetTxnOperator() == nil {
+		return nil, moerr.NewInternalError(proc.Ctx, "sequence: txn operator is nil")
+	}
+	// The internal executor may finish a lock wait after the client request has
+	// been cancelled.  Check the owning statement context at both sides of the
+	// SQL call so a sequence update cannot start after cancellation, and an
+	// update that raced cancellation is reported to the outer transaction for
+	// rollback.  The outer transaction remains the single owner of cleanup.
+	if err := sequenceContextErr(proc); err != nil {
+		return nil, err
+	}
+	accountID, err := defines.GetAccountId(proc.Ctx)
+	if err != nil {
+		return nil, err
+	}
+	v, ok := runtime.ServiceRuntime(proc.GetService()).GetGlobalVariables(runtime.InternalSQLExecutor)
+	if !ok {
+		return nil, moerr.NewInternalError(proc.Ctx, "sequence: internal SQL executor is unavailable")
+	}
+	lowerCaseTableNames := int64(1)
+	if resolve := proc.GetResolveVariableFunc(); resolve != nil {
+		if value, resolveErr := resolve("lower_case_table_names", true, false); resolveErr == nil {
+			if resolved, ok := value.(int64); ok {
+				lowerCaseTableNames = resolved
+			}
+		}
+	}
+	opts := executor.Options{}.WithTxn(proc.GetTxnOperator()).
+		WithDisableIncrStatement().WithAccountID(accountID).WithDatabase(db).
+		WithLowerCaseTableNames(&lowerCaseTableNames).
+		WithTimeZone(proc.GetSessionInfo().TimeZone).
+		WithResolveVariableFunc(proc.GetResolveVariableFunc()).WithFrontend(proc.Base.IsFrontend)
+	if proc.GetSessionInfo().LockWaitTimeoutSet {
+		opts = opts.WithLockWaitTimeout(time.Duration(proc.GetSessionInfo().LockWaitTimeout) * time.Second)
+	}
+	// Sequence metadata is a catalog-owned mutable row.  The SQL helper used
+	// before this path was introduced executed through a background executor,
+	// which marks the context with BgKey so the planner permits the internal
+	// UPDATE of a sequence relation.  Preserve that explicit internal-write
+	// contract while still using the caller's transaction and cancellation
+	// context; without it the normal frontend guard rejects the update with
+	// "Cannot insert/update/delete from sequence".
+	ctx := context.WithValue(proc.Ctx, defines.BgKey{}, true)
+	res, err := v.(executor.SQLExecutor).Exec(ctx, sql, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Close()
+	if err := sequenceContextErr(proc); err != nil {
+		return nil, err
+	}
+	var values [][]interface{}
+	res.ReadRows(func(rows int, cols []*vector.Vector) bool {
+		if rows == 0 {
+			return true
+		}
+		if rows != 1 || len(values) != 0 || len(cols) != 7 {
+			err = moerr.NewInternalError(proc.Ctx, "invalid sequence metadata shape")
+			return false
+		}
+		row := make([]interface{}, 7)
+		for i, col := range cols {
+			if col == nil || col.Length() != 1 || col.IsConstNull() || col.GetNulls().Contains(0) {
+				err = moerr.NewInternalError(proc.Ctx, "null sequence metadata")
+				return false
+			}
+			if (i < 4 && col.GetType().Oid != cols[0].GetType().Oid) ||
+				(i == 4 && col.GetType().Oid != types.T_int64) ||
+				(i >= 5 && col.GetType().Oid != types.T_bool) ||
+				(i < 4 && col.GetType().Oid == types.T_bool) {
+				err = moerr.NewInternalError(proc.Ctx, "invalid sequence metadata type")
+				return false
+			}
+			switch col.GetType().Oid {
+			case types.T_int16:
+				row[i] = vector.GetFixedAtNoTypeCheck[int16](col, 0)
+			case types.T_int32:
+				row[i] = vector.GetFixedAtNoTypeCheck[int32](col, 0)
+			case types.T_int64:
+				row[i] = vector.GetFixedAtNoTypeCheck[int64](col, 0)
+			case types.T_uint16:
+				row[i] = vector.GetFixedAtNoTypeCheck[uint16](col, 0)
+			case types.T_uint32:
+				row[i] = vector.GetFixedAtNoTypeCheck[uint32](col, 0)
+			case types.T_uint64:
+				row[i] = vector.GetFixedAtNoTypeCheck[uint64](col, 0)
+			case types.T_bool:
+				row[i] = vector.GetFixedAtNoTypeCheck[bool](col, 0)
+			default:
+				err = moerr.NewInternalError(proc.Ctx, "invalid sequence metadata type")
+				return false
+			}
+		}
+		values = append(values, row)
+		return true
+	})
+	return values, err
+}
+
+func sequenceContextErr(proc *process.Process) error {
+	if proc == nil || proc.Ctx == nil {
+		return nil
+	}
+	return proc.Ctx.Err()
+}
+
+func sequenceTableName(db, table string) string {
+	return "`" + strings.ReplaceAll(db, "`", "``") + "`.`" + strings.ReplaceAll(table, "`", "``") + "`"
+}
+
+// requireSequence verifies the catalog-owned relation kind before a sequence
+// function reads or writes the relation's sequence-shaped row. The property
+// list is metadata, not an API with a fixed order, so inspect the relkind key
+// explicitly and fail closed on missing or conflicting markers.
+func requireSequence(ctx context.Context, rel engine.Relation) error {
+	td, err := rel.TableDefs(ctx)
+	if err != nil {
+		return err
+	}
+
+	var foundSequence, foundOther bool
+	for _, def := range td {
+		properties, ok := def.(*engine.PropertiesDef)
+		if !ok || properties == nil {
+			continue
+		}
+		for _, property := range properties.Properties {
+			if property.Key != catalog.SystemRelAttr_Kind {
+				continue
+			}
+			if property.Value == catalog.SystemSequenceRel {
+				foundSequence = true
+			} else {
+				foundOther = true
+			}
+		}
+	}
+	if !foundSequence || foundOther {
+		return moerr.NewInternalError(ctx, "Table input is not a sequence")
+	}
+	return nil
+}
+
+// Retrieve values of this sequence.
+// Set curval,lastval of current session.
+// Set is_called to true if it is false, if is_]called is true Advance last_seq_num.
+// Return advanced last_seq_num.
+
+func Nextval(ivecs []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) (err error) {
+	rs := vector.MustFunctionResult[types.Varlena](result)
+	ivec := vector.GenerateFunctionStrParameter(ivecs[0])
+	var databases vector.FunctionParameterWrapper[types.Varlena]
+	if len(ivecs) > 1 {
+		databases = vector.GenerateFunctionStrParameter(ivecs[1])
+	}
+
+	// Here is the transaction
+	e := proc.Ctx.Value(defines.EngineKey{}).(engine.Engine)
+	txn := proc.GetTxnOperator()
+	if txn == nil {
+		return moerr.NewInternalError(proc.Ctx, "Nextval: txn operator is nil")
+	}
+
+	// nextval is the real implementation of nextval function.
+	for i := uint64(0); i < uint64(length); i++ {
+		v, null := ivec.GetStrValue(i)
+		db, dbNull := sequenceDatabase(proc.GetSessionInfo().Database, databases, i)
+		if null || dbNull {
+			if err = rs.AppendBytes(nil, true); err != nil {
+				return
+			}
+		} else {
+			var res string
+			release, gateErr := proc.AcquireSequence(proc.Ctx)
+			if gateErr != nil {
+				return gateErr
+			}
+			func() {
+				defer release()
+				// The gate covers the complete read/compute/write interval and
+				// publication of LASTVAL. A same-transaction sibling must not
+				// observe the row before this operation's UPDATE is complete.
+				res, err = nextval(string(v), db, proc, e, txn)
+				if err == nil && res != "" {
+					proc.GetSessionInfo().SeqLastValue[0] = res
+				}
+			}()
+			if err == nil {
+				err = rs.AppendBytes(functionUtil.QuickStrToBytes(res), false)
+			}
+			if err != nil {
+				return
+			}
+		}
+	}
+	return nil
+}
+
+func sequenceDatabase(sessionDatabase string, databases vector.FunctionParameterWrapper[types.Varlena], row uint64) (string, bool) {
+	if databases == nil {
+		return sessionDatabase, false
+	}
+	database, null := databases.GetStrValue(row)
+	return string(database), null
+}
+
+// nextval performs one complete sequence allocation. Callers must hold the
+// process sequence gate for the whole call; the public Nextval wrapper owns
+// that admission so nested metadata SQL does not recursively acquire it.
+func nextval(tblname, db string, proc *process.Process, e engine.Engine, txn client.TxnOperator) (string, error) {
+	dbHandler, err := e.Database(proc.Ctx, db, txn)
+	if err != nil {
+		return "", err
+	}
+	rel, err := dbHandler.Relation(proc.Ctx, tblname, nil)
+	if err != nil {
+		return "", err
+	}
+
+	// Check is sequence table.
+	if err := requireSequence(proc.Ctx, rel); err != nil {
+		return "", err
+	}
+
+	_values, err := sequenceSQL(proc, db, "select last_seq_num, min_value, max_value, start_value, increment_value, cycle, is_called from "+sequenceTableName(db, tblname)+" for update")
+	if err != nil {
+		return "", err
+	}
+	if len(_values) != 1 {
+		return "", moerr.NewInternalError(proc.Ctx, "Failed to get sequence meta data.")
+	}
+	values := _values[0]
+
+	// Keep the parsed value wide until after range validation. Narrowing first
+	// can wrap an out-of-range SETVAL into a value accepted by the sequence.
+	switch values[0].(type) {
+	case int16:
+		// Get values store in sequence table.
+		lsn, minv, maxv, _, incrv, cycle, isCalled := values[0].(int16), values[1].(int16), values[2].(int16),
+			values[3].(int16), values[4].(int64), values[5].(bool), values[6].(bool)
+		// When iscalled is not set, set it and do not advance sequence number.
+		if !isCalled {
+			return setIsCalled(proc, rel, lsn, db, tblname)
+		}
+		// When incr is over the range of this datatype.
+		if incrv > math.MaxInt16 || incrv < math.MinInt16 {
+			if cycle {
+				return advanceSeq(lsn, minv, maxv, int16(incrv), cycle, incrv < 0, setEdge, rel, proc, db, tblname)
+			} else {
+				return "", moerr.NewInternalErrorf(proc.Ctx, "Reached maximum value of sequence %s", tblname)
+			}
+		}
+		// Tranforming incrv to this datatype and make it positive for generic use.
+		return advanceSeq(lsn, minv, maxv, makePosIncr[int16](incrv), cycle, incrv < 0, !setEdge, rel, proc, db, tblname)
+	case int32:
+		lsn, minv, maxv, _, incrv, cycle, isCalled := values[0].(int32), values[1].(int32), values[2].(int32),
+			values[3].(int32), values[4].(int64), values[5].(bool), values[6].(bool)
+		if !isCalled {
+			return setIsCalled(proc, rel, lsn, db, tblname)
+		}
+		/*
+			no incrv can be bigger than maxint64 or smaller than minint64, therefore the following is noop
+
+			if incrv > math.MaxInt64 || incrv < math.MinInt64 {
+				if cycle {
+					return advanceSeq(lsn, minv, maxv, int32(incrv), cycle, incrv < 0, setEdge, rel, proc, db, tblname)
+				} else {
+					return "", moerr.NewInternalError(proc.Ctx, "Reached maximum value of sequence %s", tblname)
+				}
+			}
+		*/
+		return advanceSeq(lsn, minv, maxv, makePosIncr[int32](incrv), cycle, incrv < 0, !setEdge, rel, proc, db, tblname)
+	case int64:
+		lsn, minv, maxv, _, incrv, cycle, isCalled := values[0].(int64), values[1].(int64), values[2].(int64),
+			values[3].(int64), values[4].(int64), values[5].(bool), values[6].(bool)
+		if !isCalled {
+			return setIsCalled(proc, rel, lsn, db, tblname)
+		}
+		return advanceSeq(lsn, minv, maxv, makePosIncr[int64](incrv), cycle, incrv < 0, !setEdge, rel, proc, db, tblname)
+	case uint16:
+		lsn, minv, maxv, _, incrv, cycle, isCalled := values[0].(uint16), values[1].(uint16), values[2].(uint16),
+			values[3].(uint16), values[4].(int64), values[5].(bool), values[6].(bool)
+		if !isCalled {
+			return setIsCalled(proc, rel, lsn, db, tblname)
+		}
+		if incrv > math.MaxUint16 || -incrv > math.MaxUint16 {
+			if cycle {
+				return advanceSeq(lsn, minv, maxv, uint16(incrv), cycle, incrv < 0, setEdge, rel, proc, db, tblname)
+			} else {
+				return "", moerr.NewInternalErrorf(proc.Ctx, "Reached maximum value of sequence %s", tblname)
+			}
+		}
+		return advanceSeq(lsn, minv, maxv, makePosIncr[uint16](incrv), cycle, incrv < 0, !setEdge, rel, proc, db, tblname)
+	case uint32:
+		lsn, minv, maxv, _, incrv, cycle, isCalled := values[0].(uint32), values[1].(uint32), values[2].(uint32),
+			values[3].(uint32), values[4].(int64), values[5].(bool), values[6].(bool)
+		if !isCalled {
+			return setIsCalled(proc, rel, lsn, db, tblname)
+		}
+		if incrv > math.MaxUint32 || -incrv > math.MaxUint32 {
+			if cycle {
+				return advanceSeq(lsn, minv, maxv, uint32(incrv), cycle, incrv < 0, setEdge, rel, proc, db, tblname)
+			} else {
+				return "", moerr.NewInternalErrorf(proc.Ctx, "Reached maximum value of sequence %s", tblname)
+			}
+		}
+		return advanceSeq(lsn, minv, maxv, makePosIncr[uint32](incrv), cycle, incrv < 0, !setEdge, rel, proc, db, tblname)
+	case uint64:
+		lsn, minv, maxv, _, incrv, cycle, isCalled := values[0].(uint64), values[1].(uint64), values[2].(uint64),
+			values[3].(uint64), values[4].(int64), values[5].(bool), values[6].(bool)
+		if !isCalled {
+			return setIsCalled(proc, rel, lsn, db, tblname)
+		}
+		return advanceSeq(lsn, minv, maxv, makePosIncr[uint64](incrv), cycle, incrv < 0, !setEdge, rel, proc, db, tblname)
+	}
+
+	return "", moerr.NewInternalError(proc.Ctx, "Wrong types of sequence number or failed to read the sequence table")
+}
+
+func makePosIncr[T constraints.Integer](incr int64) T {
+	if incr < 0 {
+		return T(-incr)
+	}
+	return T(incr)
+}
+
+func advanceSeq[T constraints.Integer](lsn, minv, maxv, incrv T,
+	cycle, minus, setEdge bool, rel engine.Relation, proc *process.Process, db, tblname string) (string, error) {
+	if setEdge {
+		// Set lastseqnum to maxv when this is a descending sequence.
+		if minus {
+			return setSeq(proc, maxv, rel, db, tblname)
+		}
+		// Set lastseqnum to minv
+		return setSeq(proc, minv, rel, db, tblname)
+	}
+	var adseq T
+	if minus {
+		adseq = lsn - incrv
+	} else {
+		adseq = lsn + incrv
+	}
+
+	// check descending sequence and reach edge
+	if minus && (adseq < minv || adseq > lsn) {
+		if !cycle {
+			return "", moerr.NewInternalErrorf(proc.Ctx, "Reached maximum value of sequence %s", tblname)
+		}
+		return setSeq(proc, maxv, rel, db, tblname)
+	}
+
+	// checkout ascending sequence and reach edge
+	if !minus && (adseq > maxv || adseq < lsn) {
+		if !cycle {
+			return "", moerr.NewInternalErrorf(proc.Ctx, "Reached maximum value of sequence %s", tblname)
+		}
+		return setSeq(proc, minv, rel, db, tblname)
+	}
+
+	// Otherwise set to adseq.
+	return setSeq(proc, adseq, rel, db, tblname)
+}
+
+func setSeq[T constraints.Integer](proc *process.Process, setv T, rel engine.Relation, db, tbl string) (string, error) {
+	_, err := sequenceSQL(proc, db, fmt.Sprintf("update %s set last_seq_num = %d", sequenceTableName(db, tbl), setv))
+	if err != nil {
+		return "", err
+	}
+
+	tblId := rel.GetTableID(proc.Ctx)
+	ress := fmt.Sprint(setv)
+
+	// Set Curvalues here. Add new slot to proc's related field.
+	proc.GetSessionInfo().SeqAddValues[tblId] = ress
+
+	return ress, nil
+}
+
+func setIsCalled[T constraints.Integer](proc *process.Process, rel engine.Relation, lsn T, db, tbl string) (string, error) {
+	// Set is called to true.
+	_, err := sequenceSQL(proc, db, fmt.Sprintf("update %s set is_called = true", sequenceTableName(db, tbl)))
+	if err != nil {
+		return "", err
+	}
+
+	tblId := rel.GetTableID(proc.Ctx)
+	ress := fmt.Sprint(lsn)
+
+	// Set Curvalues here. Add new slot to proc's related field.
+	proc.GetSessionInfo().SeqAddValues[tblId] = ress
+
+	return ress, nil
+}
+
+func Setval(ivecs []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) (err error) {
+	rs := vector.MustFunctionResult[types.Varlena](result)
+	tblnames := vector.GenerateFunctionStrParameter(ivecs[0])
+	setnums := vector.GenerateFunctionStrParameter(ivecs[1])
+	var iscalled vector.FunctionParameterWrapper[bool]
+	if len(ivecs) > 2 {
+		iscalled = vector.GenerateFunctionFixedTypeParameter[bool](ivecs[2])
+	}
+	var databases vector.FunctionParameterWrapper[types.Varlena]
+	if len(ivecs) > 3 {
+		databases = vector.GenerateFunctionStrParameter(ivecs[3])
+	}
+
+	// Txn
+	e := proc.Ctx.Value(defines.EngineKey{}).(engine.Engine)
+	txn := proc.GetTxnOperator()
+	if txn == nil {
+		return moerr.NewInternalError(proc.Ctx, "Setval: txn operator is nil")
+	}
+
+	for i := uint64(0); i < uint64(length); i++ {
+		tn, tnNull := tblnames.GetStrValue(i)
+		sn, snNull := setnums.GetStrValue(i)
+		isc := true
+		iscNull := false
+		if iscalled != nil {
+			isc, iscNull = iscalled.GetValue(i)
+		}
+		db, dbNull := sequenceDatabase(proc.GetSessionInfo().Database, databases, i)
+
+		if tnNull || snNull || iscNull || dbNull {
+			if err = rs.AppendBytes(nil, true); err != nil {
+				return
+			}
+		} else {
+			var res string
+			release, gateErr := proc.AcquireSequence(proc.Ctx)
+			if gateErr != nil {
+				return gateErr
+			}
+			func() {
+				defer release()
+				// SETVAL has the same caller-transaction read/compute/write
+				// interval as NEXTVAL and updates session sequence state inside
+				// that interval.
+				res, err = setval(string(tn), string(sn), isc, db, proc, txn, e)
+			}()
+			if err == nil {
+				err = rs.AppendBytes(functionUtil.QuickStrToBytes(res), false)
+			}
+			if err != nil {
+				return
+			}
+		}
+	}
+	return
+}
+
+// setval performs one complete sequence assignment. Callers must hold the
+// process sequence gate for the whole call, just like nextval.
+func setval(tblname, setnum string, iscalled bool, db string, proc *process.Process, txn client.TxnOperator, e engine.Engine) (string, error) {
+	dbHandler, err := e.Database(proc.Ctx, db, txn)
+	if err != nil {
+		return "", err
+	}
+	rel, err := dbHandler.Relation(proc.Ctx, tblname, nil)
+	if err != nil {
+		return "", err
+	}
+	if err := requireSequence(proc.Ctx, rel); err != nil {
+		return "", err
+	}
+
+	_values, err := sequenceSQL(proc, db, "select last_seq_num, min_value, max_value, start_value, increment_value, cycle, is_called from "+sequenceTableName(db, tblname)+" for update")
+	if err != nil {
+		return "", err
+	}
+	if len(_values) != 1 {
+		return "", moerr.NewInternalError(proc.Ctx, "Failed to get sequence meta data.")
+	}
+	values := _values[0]
+
+	switch values[0].(type) {
+	case int16:
+		minv, maxv := values[1].(int16), values[2].(int16)
+		// Parse and compare.
+		setnum, err := strconv.ParseInt(setnum, 10, 64)
+		if err != nil {
+			return "", err
+		}
+		if setnum < int64(minv) || setnum > int64(maxv) {
+			return "", moerr.NewInternalError(proc.Ctx, "Set value is not in range (minvalue, maxvlue).")
+		}
+		return setVal(proc, int16(setnum), iscalled, rel, db, tblname)
+	case int32:
+		minv, maxv := values[1].(int32), values[2].(int32)
+		setnum, err := strconv.ParseInt(setnum, 10, 64)
+		if err != nil {
+			return "", err
+		}
+		if setnum < int64(minv) || setnum > int64(maxv) {
+			return "", moerr.NewInternalError(proc.Ctx, "Set value is not in range (minvalue, maxvlue).")
+		}
+		return setVal(proc, int32(setnum), iscalled, rel, db, tblname)
+	case int64:
+		minv, maxv := values[1].(int64), values[2].(int64)
+		setnum, err := strconv.ParseInt(setnum, 10, 64)
+		if err != nil {
+			return "", err
+		}
+		if setnum < minv || setnum > maxv {
+			return "", moerr.NewInternalError(proc.Ctx, "Set value is not in range (minvalue, maxvlue).")
+		}
+		return setVal(proc, setnum, iscalled, rel, db, tblname)
+	case uint16:
+		minv, maxv := values[1].(uint16), values[2].(uint16)
+		setnum, err := strconv.ParseUint(setnum, 10, 64)
+		if err != nil {
+			return "", err
+		}
+		if setnum < uint64(minv) || setnum > uint64(maxv) {
+			return "", moerr.NewInternalError(proc.Ctx, "Set value is not in range (minvalue, maxvlue).")
+		}
+		return setVal(proc, uint16(setnum), iscalled, rel, db, tblname)
+	case uint32:
+		minv, maxv := values[1].(uint32), values[2].(uint32)
+		setnum, err := strconv.ParseUint(setnum, 10, 64)
+		if err != nil {
+			return "", err
+		}
+		if setnum < uint64(minv) || setnum > uint64(maxv) {
+			return "", moerr.NewInternalError(proc.Ctx, "Set value is not in range (minvalue, maxvlue).")
+		}
+		return setVal(proc, uint32(setnum), iscalled, rel, db, tblname)
+	case uint64:
+		minv, maxv := values[1].(uint64), values[2].(uint64)
+		setnum, err := strconv.ParseUint(setnum, 10, 64)
+		if err != nil {
+			return "", err
+		}
+		if setnum < minv || setnum > maxv {
+			return "", moerr.NewInternalError(proc.Ctx, "Set value is not in range (minvalue, maxvlue).")
+		}
+		return setVal(proc, setnum, iscalled, rel, db, tblname)
+	}
+	return "", moerr.NewInternalError(proc.Ctx, "Wrong types of sequence number or failed to read the sequence table")
+}
+
+func setVal[T constraints.Integer](proc *process.Process, setv T, setisCalled bool, rel engine.Relation, db, tbl string) (string, error) {
+	_, err := sequenceSQL(proc, db, fmt.Sprintf("update %s set last_seq_num = %d", sequenceTableName(db, tbl), setv))
+	if err != nil {
+		return "", err
+	}
+
+	ress := fmt.Sprint(setv)
+	if setisCalled {
+		tblId := rel.GetTableID(proc.Ctx)
+
+		proc.GetSessionInfo().SeqAddValues[tblId] = ress
+
+		// Only set lastvalue when it is already initialized.
+		if proc.GetSessionInfo().SeqLastValue[0] != "" {
+			proc.GetSessionInfo().SeqLastValue[0] = ress
+		}
+	}
+
+	return ress, nil
+}
+
+func Currval(ivecs []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) (err error) {
+	rs := vector.MustFunctionResult[types.Varlena](result)
+	ivec := vector.GenerateFunctionStrParameter(ivecs[0])
+	var databases vector.FunctionParameterWrapper[types.Varlena]
+	if len(ivecs) > 1 {
+		databases = vector.GenerateFunctionStrParameter(ivecs[1])
+	}
+
+	// Here is the transaction
+	e := proc.Ctx.Value(defines.EngineKey{}).(engine.Engine)
+	txn := proc.GetTxnOperator()
+	if txn == nil {
+		return moerr.NewInternalError(proc.Ctx, "Currval: txn operator is nil")
+	}
+	release, err := proc.AcquireSequence(proc.Ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	// A vector may contain repeated sequence names. Resolve each effective
+	// database once per batch; hidden view arguments can vary by row, so cache
+	// by database name rather than assuming one database for the whole vector.
+	databasesByName := make(map[string]engine.Database, 1)
+	for i := uint64(0); i < uint64(length); i++ {
+		v, null := ivec.GetStrValue(i)
+		db, dbNull := sequenceDatabase(proc.GetSessionInfo().Database, databases, i)
+		if null || dbNull {
+			if err = rs.AppendBytes(nil, true); err != nil {
+				return
+			}
+		} else {
+			dbHandler, ok := databasesByName[db]
+			if !ok {
+				var dbErr error
+				dbHandler, dbErr = e.Database(proc.Ctx, db, txn)
+				if dbErr != nil {
+					return dbErr
+				}
+				databasesByName[db] = dbHandler
+			}
+			var rel engine.Relation
+			rel, err = dbHandler.Relation(proc.Ctx, string(v), nil)
+			if err != nil {
+				return
+			}
+			tblId := rel.GetTableID(proc.Ctx)
+			// Get cur values here.
+			ss, exists := proc.GetSessionInfo().SeqCurValues[tblId]
+			// If nextval called before this currval.Check add values
+			ss1, existsAdd := proc.GetSessionInfo().SeqAddValues[tblId]
+			if !exists && !existsAdd {
+				err = moerr.NewInternalErrorf(proc.Ctx, "Currvalue of %s in current session is not initialized", v)
+				return
+			}
+			// Assign the values of SeqAddValues first, cause this values is the updated curvals.
+			if existsAdd {
+				err = rs.AppendBytes(functionUtil.QuickStrToBytes(ss1), false)
+			} else {
+				err = rs.AppendBytes(functionUtil.QuickStrToBytes(ss), false)
+			}
+			if err != nil {
+				return
+			}
+		}
+	}
+	return
+}
+
+func Lastval(ivecs []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) (err error) {
+	release, err := proc.AcquireSequence(proc.Ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	// Get last value
+	lastv := proc.GetSessionInfo().SeqLastValue[0]
+	if lastv == "" {
+		return moerr.NewInternalError(proc.Ctx, "Last value of current session is not initialized.")
+	}
+
+	rs := vector.MustFunctionResult[types.Varlena](result)
+	for i := uint64(0); i < uint64(length); i++ {
+		if err = rs.AppendBytes(functionUtil.QuickStrToBytes(lastv), false); err != nil {
+			return
+		}
+	}
+	return
+}

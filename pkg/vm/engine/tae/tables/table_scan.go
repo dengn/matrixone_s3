@@ -1,0 +1,257 @@
+// Copyright 2021 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package tables
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
+	"go.uber.org/zap"
+)
+
+func HybridScanByBlock(
+	ctx context.Context,
+	tableEntry *catalog.TableEntry,
+	txn txnif.TxnReader,
+	bat **containers.Batch,
+	readSchema *catalog.Schema,
+	colIdxs []int,
+	blkID *objectio.Blockid,
+	mp *mpool.MPool,
+) error {
+	dataObject, err := tableEntry.GetObjectByID(blkID.Object(), false)
+	if err != nil {
+		return err
+	}
+	_, offset := blkID.Offsets()
+	deleteStartOffset := 0
+	if *bat != nil {
+		deleteStartOffset = (*bat).Length()
+	}
+	err = dataObject.GetObjectData().Scan(ctx, bat, txn, readSchema, offset, colIdxs, mp)
+	if err != nil {
+		return err
+	}
+	if *bat == nil {
+		return nil
+	}
+	it := tableEntry.MakeTombstoneVisibleObjectIt(txn)
+	defer it.Release()
+	for it.Next() {
+		tombstone := it.Item()
+		err := tombstone.GetObjectData().FillBlockTombstones(ctx, txn, blkID, &(*bat).Deletes, uint64(deleteStartOffset), mp)
+		if err != nil {
+			(*bat).Close()
+			return err
+		}
+	}
+	id := dataObject.AsCommonID()
+	id.BlockID = *blkID
+	err = txn.GetStore().FillInWorkspaceDeletes(id, &(*bat).Deletes, uint64(deleteStartOffset))
+	if err != nil {
+		(*bat).Close()
+	}
+	return err
+}
+
+/*
+TombstoneRangeScanByObject scans the an object's tombstones committed in the range [start, end] and returns a batch of data.
+
+Since the returned batch must have accruate ts for each row, we need collect the data from appendable objects.
+
+Targets:
+ 1. CNCreated entries where start <= CreatedAt <= end. These immutable source
+    objects remain the unique scan owners after tombstone merges; scanning the
+    TN-created copies as well would duplicate the same delete rows.
+ 2. Appendable entries whose catalog lifetime can overlap the range. All live
+    appendable entries created before end remain candidates because their rows
+    can commit out of object creation order.
+*/
+func TombstoneRangeScanByObject(
+	ctx context.Context,
+	tableEntry *catalog.TableEntry,
+	objectID objectio.ObjectId,
+	start, end types.TS,
+	mp *mpool.MPool,
+	vpool *containers.VectorPool,
+) (bat *containers.Batch, err error) {
+	tableEntry.WaitTombstoneObjectCommitted(end)
+	it := tableEntry.MakeTombstoneObjectIt()
+	defer it.Release()
+	// CreatedAt orders catalog publication, not the commit timestamps of rows
+	// appended later. Concurrent flushes can populate multiple appendable
+	// tombstone objects and commit them out of creation order, so an older
+	// object can still contain deletes in [start, end]. Do not stop the scan
+	// solely because an object's catalog lifetime precedes start.
+	for ok := it.Last(); ok; ok = it.Prev() {
+		tombstone := it.Item()
+		if tombstone.IsAppendable() && tombstone.IsCEntry() &&
+			tombstone.HasDCounterpart() && tombstone.GetNextVersion().HasDropCommitted() {
+			// The D counterpart owns the same persisted appendable data. A
+			// non-appendable C entry is different: it is the immutable
+			// CN-created source of a tombstone merge and remains the unique
+			// range-scan owner after its drop commits.
+			continue
+		}
+
+		if tombstone.IsAppendable() {
+			if tombstone.CreatedAt.GT(&end) {
+				// committing create object is excluded here
+				continue
+			}
+			if tombstone.DeletedAt.Equal(&txnif.UncommitTS) {
+				// Its C counterpart remains visible until the drop commits.
+				continue
+			}
+			if tombstone.HasDropCommitted() {
+				deleteAt := tombstone.GetDeleteAt()
+				if tombstone.CreatedAt.GT(&end) || deleteAt.LT(&start) {
+					continue
+				}
+			}
+		} else {
+			// Check only CN-created immutable source versions. Tombstone-merge
+			// outputs copy these rows and are deliberately excluded below.
+			if tombstone.HasDropIntent() {
+				continue
+			}
+			// A CN-side publication rewrite retains CN provenance on its output.
+			// Once the explicitly marked D counterpart commits within the scan
+			// range, this C entry no longer owns the rows; its CN replacement (if
+			// any) is the unique range-scan owner.
+			if tombstone.IsCEntry() && tombstone.HasDCounterpart() {
+				drop := tombstone.GetNextVersion()
+				deleteAt := drop.GetDeleteAt()
+				if drop.HasDropCommitted() && !deleteAt.GT(&end) &&
+					drop.ObjectStats.GetCNDeleted() {
+					continue
+				}
+			}
+			if !tombstone.ObjectStats.GetCNCreated() {
+				continue
+			}
+			if tombstone.CreatedAt.GT(&end) || tombstone.CreatedAt.LT(&start) {
+				continue
+			}
+		}
+
+		if tombstone.HasCommittedPersistedData() {
+			zm := tombstone.SortKeyZoneMap()
+			if !zm.RowidPrefixEq(objectID[:]) {
+				continue
+			}
+			// TODO: Bloomfilter
+		}
+		err = tombstone.GetObjectData().CollectObjectTombstoneInRange(ctx, start, end, &objectID, &bat, mp, vpool)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return
+}
+
+func RangeScanInMemoryByObject(
+	ctx context.Context,
+	objEntry *catalog.ObjectEntry,
+	batches map[uint32]*containers.BatchWithVersion,
+	start, end types.TS,
+	mp *mpool.MPool,
+) (err error) {
+	err = objEntry.GetObjectData().ScanInMemory(ctx, batches, start, end, mp)
+	return
+}
+
+// TODO: ensure bat does not exceed the 1G limit
+func ReadSysTableBatch(ctx context.Context, entry *catalog.TableEntry, readTxn txnif.AsyncTxn) *containers.Batch {
+	if entry.ID > 3 {
+		panic(fmt.Sprintf("unsupported sys table id %v", entry))
+	}
+	schema := entry.GetLastestSchema(false)
+	prefetchIt := entry.MakeDataVisibleObjectIt(readTxn)
+	defer prefetchIt.Release()
+	for prefetchIt.Next() {
+		obj := prefetchIt.Item()
+		for blkOffset := range obj.BlockCnt() {
+			obj.GetObjectData().Prefetch(uint16(blkOffset))
+		}
+	}
+	it := entry.MakeDataVisibleObjectIt(readTxn)
+	defer it.Release()
+	colIdxes := make([]int, 0, len(schema.ColDefs))
+	for _, col := range schema.ColDefs {
+		if col.IsPhyAddr() {
+			continue
+		}
+		colIdxes = append(colIdxes, col.Idx)
+	}
+	var bat *containers.Batch
+	prevLen := 0
+	for it.Next() {
+		obj := it.Item()
+		for blkOffset := range obj.BlockCnt() {
+			blkid := objectio.NewBlockidWithObjectID(obj.ID(), uint16(blkOffset))
+			err := HybridScanByBlock(ctx, entry, readTxn, &bat, schema, colIdxes, &blkid, common.CheckpointAllocator)
+			if err != nil || bat == nil || bat.Length() == prevLen {
+				panic(fmt.Sprintf("blkbat is nil, obj %v, blkid %v, err %v", obj.ID().String(), blkOffset, err))
+			}
+		}
+	}
+	if bat != nil {
+		bat.Compact()
+	}
+	return bat
+}
+
+func ReadMergeSettingsBatch(ctx context.Context, entry *catalog.TableEntry, readTxn txnif.AsyncTxn) *containers.Batch {
+	schema := entry.GetLastestSchema(false)
+	it := entry.MakeDataVisibleObjectIt(readTxn)
+	defer it.Release()
+	colIdxes := make([]int, 0, len(schema.ColDefs))
+	for _, col := range schema.ColDefs {
+		if col.IsPhyAddr() {
+			continue
+		}
+		colIdxes = append(colIdxes, col.Idx)
+	}
+	var bat *containers.Batch
+	prevLen := 0
+	for it.Next() {
+		obj := it.Item()
+		for blkOffset := range obj.BlockCnt() {
+			blkid := objectio.NewBlockidWithObjectID(obj.ID(), uint16(blkOffset))
+			err := HybridScanByBlock(ctx, entry, readTxn, &bat, schema, colIdxes, &blkid, common.MergeAllocator)
+			if err != nil || bat == nil || bat.Length() == prevLen {
+				logutil.Error("ReadMergeSettingsBatch",
+					zap.String("event", "read settings empty"),
+					zap.String("obj", obj.ID().String()),
+					zap.Int("blkOffset", blkOffset),
+					zap.Error(err),
+				)
+			}
+		}
+	}
+	if bat != nil {
+		bat.Compact()
+	}
+	return bat
+}

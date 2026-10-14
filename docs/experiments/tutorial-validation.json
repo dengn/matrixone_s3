@@ -1,0 +1,7 @@
+{
+  "source_build": "make build-with-prebuilt-native passed; verified native dependencies reused, Go source rebuilt from this snapshot",
+  "demo": "3 consecutive full runs passed with newly built ./mo-service",
+  "reattach": "reader recovered closed demo database and returned 3 rows, sum 46.00",
+  "known_issue": "one earlier post-transaction update wait timed out; subsequent repetitions passed; root cause not identified",
+  "scope": "local Moto S3 emulator, synthetic rows; not production validation"
+}

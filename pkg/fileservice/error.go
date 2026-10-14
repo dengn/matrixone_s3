@@ -1,0 +1,194 @@
+// Copyright 2022 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package fileservice
+
+import (
+	"crypto/tls"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"regexp"
+	"strings"
+	"syscall"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/minio/minio-go/v7"
+	"github.com/tencentyun/cos-go-sdk-v5"
+)
+
+func IsRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var cosRetryErr *cos.RetryError
+	if errors.As(err, &cosRetryErr) && len(cosRetryErr.Errs) > 0 {
+		for _, innerErr := range cosRetryErr.Errs {
+			if IsRetryableError(innerErr) {
+				return true
+			}
+		}
+		return false
+	}
+
+	var cosErr *cos.ErrorResponse
+	if errors.As(err, &cosErr) && cosErr.Response != nil {
+		statusCode := cosErr.Response.StatusCode
+		if statusCode >= http.StatusInternalServerError ||
+			statusCode == http.StatusTooManyRequests {
+			return true
+		}
+	}
+
+	str := err.Error()
+
+	// unexpected EOF
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+
+	// net timeout
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	// match exact string
+	switch str {
+	case "connection reset by peer",
+		"connection timed out":
+		return true
+	}
+
+	// match sub-string
+	if strings.Contains(str, "unexpected EOF") ||
+		strings.Contains(str, "connection reset by peer") ||
+		strings.Contains(str, "connection timed out") ||
+		strings.Contains(str, "dial tcp: lookup") ||
+		strings.Contains(str, "server closed idle connection") ||
+		strings.Contains(str, "server closed connection") ||
+		strings.Contains(str, "i/o timeout") ||
+		strings.Contains(str, "server closed idle connection") ||
+		strings.Contains(str, "write: broken pipe") ||
+		strings.Contains(str, "TLS handshake timeout") ||
+		strings.Contains(str, "replication in progress") || // HDFS error
+		strings.Contains(str, "use of closed network connection") {
+		return true
+	}
+
+	return false
+}
+
+// IsRetryableStartupError extends the steady-state file-service retry policy
+// with failures that are transient while a service endpoint is coming up.
+// Startup callers use this policy; regular file-service operations keep their
+// existing bounded retry behavior and fail fast on an unreachable endpoint.
+func IsRetryableStartupError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if IsRetryableError(err) {
+		return true
+	}
+
+	var minioErr minio.ErrorResponse
+	if errors.As(err, &minioErr) {
+		statusCode := minioErr.StatusCode
+		if statusCode == http.StatusRequestTimeout ||
+			statusCode == http.StatusTooManyRequests ||
+			statusCode >= http.StatusInternalServerError {
+			return true
+		}
+	}
+
+	str := err.Error()
+	// MinIO's broad network classifier treats endpoint protocol mismatches as
+	// host-down, although its request retryer correctly rejects both cases.
+	if strings.Contains(str, "server gave HTTP response to HTTPS client") ||
+		strings.Contains(str, "Client sent an HTTP request to an HTTPS server") {
+		return false
+	}
+
+	// MinIO wraps an EOF returned by its HTTP transport in a url.Error whose
+	// inner error has no typed sentinel. Use the SDK's canonical classifier for
+	// that case, but keep certificate verification failures fail-fast.
+	var certificateErr *tls.CertificateVerificationError
+	if errors.As(err, &certificateErr) {
+		return false
+	}
+	if minio.IsNetworkOrHostDown(err, false) {
+		return true
+	}
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+
+	return errors.Is(err, syscall.ECONNREFUSED)
+}
+
+type errorStr string
+
+func (e errorStr) Error() string {
+	return string(e)
+}
+
+type throwError struct {
+	err error
+}
+
+func throw(err error) {
+	panic(throwError{
+		err: err,
+	})
+}
+
+func catch(ptr *error) {
+	p := recover()
+	if p == nil {
+		return
+	}
+	e, ok := p.(throwError)
+	if !ok {
+		panic(p)
+	} else {
+		*ptr = e.err
+	}
+}
+
+var httpBadLengthPattern = regexp.MustCompile(`transport connection broken: http: ContentLength=[0-9]* with Body length [0-9]*`)
+
+func wrapSizeMismatchErr(p *error) {
+	if *p == nil {
+		return
+	}
+	str := (*p).Error()
+
+	if strings.Contains(str, "size does not match") ||
+		httpBadLengthPattern.MatchString(str) {
+		*p = moerr.NewSizeNotMatchNoCtx("")
+	}
+
+}
+
+func isDiskFull(err error) bool {
+	if err == nil {
+		return false
+	}
+	str := err.Error()
+	return strings.Contains(str, "disk quota exceeded")
+}

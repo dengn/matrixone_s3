@@ -1,0 +1,37 @@
+drop database if exists test;
+create database test;
+use test;
+
+create table t1(a int primary key);
+create table t2(a int);
+insert into t2 select * from generate_series(1, 819200)g;
+
+begin;
+replace into t1 select a from t2 where a mod 11 = 0;
+replace into t1 select a from t2 where a mod 13 = 0;
+replace into t1 select a from t2 where a mod 17 = 0;
+rollback;
+
+-- issue #24472: REPLACE INTO SELECT from a large source should not choose
+-- shuffle DEDUP JOIN when OldColCapture is required.
+create table t_replace_shuffle_capture(a int primary key, b int, marker int);
+begin;
+replace into t_replace_shuffle_capture select a, a, 24472 from t2;
+rollback;
+
+-- An AP MergeTop nested below HashBuild must publish its final
+-- LIMIT batch once instead of replaying it until the CN runs out of memory.
+create table t_replace_mergetop_once(a int primary key, marker int);
+insert into t_replace_mergetop_once select a, 0 from t2;
+select a, marker from t_replace_mergetop_once order by a desc limit 1;
+replace into t_replace_mergetop_once
+select a, marker + 1 from t_replace_mergetop_once order by a desc limit 1;
+select count(*) as total, min(a) as min_a, max(a) as max_a, sum(marker) as marker_sum
+from t_replace_mergetop_once;
+select a, marker from t_replace_mergetop_once where marker <> 0;
+
+drop table if exists t1;
+drop table if exists t_replace_shuffle_capture;
+drop table if exists t_replace_mergetop_once;
+drop table if exists t2;
+drop database if exists test;

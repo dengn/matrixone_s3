@@ -1,0 +1,5 @@
+ok  	github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/wal	0.309s
+ok  	github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog	0.137s
+ok  	github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db	0.140s
+ok  	github.com/matrixorigin/matrixone/pkg/frontend	0.094s
+ok  	github.com/matrixorigin/matrixone/pkg/cnservice	0.084s

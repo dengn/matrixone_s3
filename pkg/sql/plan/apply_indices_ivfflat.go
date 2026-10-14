@@ -1,0 +1,1838 @@
+// Copyright 2024 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package plan
+
+import (
+	"fmt"
+	"math"
+	"strings"
+
+	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+	ivfflatplan "github.com/matrixorigin/matrixone/pkg/vectorindex/ivfflat/plugin/plan"
+	"github.com/matrixorigin/matrixone/pkg/vectorindex/metric"
+	"github.com/matrixorigin/matrixone/pkg/vectorindex/overfetch"
+	"github.com/matrixorigin/matrixone/pkg/vectorindex/quantizer"
+)
+
+type ivfIndexContext struct {
+	vecCtx          *vectorSortContext
+	metaDef         *plan.IndexDef
+	idxDef          *plan.IndexDef
+	entriesDef      *plan.IndexDef
+	vecLitArg       *plan.Expr
+	origFuncName    string
+	partPos         int32
+	partType        plan.Type
+	pkPos           int32
+	pkType          plan.Type
+	lossyEntries    bool
+	nThread         int64
+	nProbe          int64
+	totalLists      int64
+	pushdownEnabled bool
+
+	// Auto mode support.
+	isAutoMode      bool   // Whether in auto mode
+	initialStrategy string // Initial strategy selected in auto mode ("pre" or "post")
+}
+
+// shouldUseForceMode determines if force mode (full table scan) should be used
+// based on table size and LIMIT value.
+//
+// Rule: Use force mode when table_rows < LIMIT × 2
+//
+// Rationale:
+//   - For very small datasets, index overhead (metadata reading, distance calculation)
+//     exceeds the benefit of using an index
+//   - Full table scan is faster and guarantees 100% recall
+//   - Does not rely on filter selectivity estimation (which may be inaccurate)
+//
+// Returns true if force mode should be used, false otherwise.
+func (builder *QueryBuilder) shouldUseForceMode(vecCtx *vectorSortContext) bool {
+	scanNode := vecCtx.scanNode
+	stats := scanNode.Stats
+
+	// Get table row count and selectivity from statistics
+	var tableCnt float64
+	var selectivity float64 = 1.0
+
+	if stats != nil {
+		tableCnt = stats.TableCnt
+		if stats.Selectivity > 0 && stats.Selectivity < 1 {
+			selectivity = stats.Selectivity
+		}
+	}
+
+	// If no statistics available, conservatively use post mode
+	if tableCnt <= 0 {
+		return false
+	}
+
+	// Get LIMIT value
+	limitExpr := vecCtx.limit
+	if limitExpr == nil {
+		return false
+	}
+
+	limitConst := limitExpr.GetLit()
+	if limitConst == nil {
+		return false
+	}
+
+	limitVal := float64(limitConst.GetU64Val())
+	if limitVal <= 0 {
+		return false
+	}
+
+	// Rule: Estimated rows after filtering < LIMIT × 2
+	// For small result sets, brute force (force mode) is more reliable and often faster
+	estimatedRows := tableCnt * selectivity
+	threshold := limitVal * 2.0
+
+	if tableCnt < threshold || estimatedRows < threshold {
+		logutil.Debugf(
+			"Auto mode: small dataset or high selectivity detected, table_rows=%.0f, selectivity=%.4f, estimated_rows=%.0f, limit=%.0f, threshold=%.0f",
+			tableCnt, selectivity, estimatedRows, limitVal, threshold,
+		)
+		return true
+	}
+
+	return false
+}
+
+// resolveVectorSearchMode resolves the vector search mode based on user input and configuration.
+// Returns:
+//   - mode: The actual mode to use ("pre", "post", or "force")
+//   - isAutoMode: Whether auto mode is enabled
+//   - shouldDisableIndex: Whether vector index should be disabled
+func (builder *QueryBuilder) resolveVectorSearchMode(
+	vecCtx *vectorSortContext,
+	enableVectorPrefilterByDefault bool,
+	enableVectorAutoModeByDefault bool,
+) (mode string, isAutoMode bool, shouldDisableIndex bool) {
+
+	// 1. Parse user-specified mode
+	var userMode string
+	if vecCtx.rankOption != nil && vecCtx.rankOption.Mode != "" {
+		userMode = vecCtx.rankOption.Mode
+	}
+
+	// 2. Handle force mode: disable vector index
+	if userMode == "force" {
+		return "force", false, true
+	}
+
+	// 3. Handle auto mode
+	if userMode == "auto" || (userMode == "" && enableVectorAutoModeByDefault) {
+		isAutoMode = true
+
+		// Check if this is a very small dataset.
+		if builder.shouldUseForceMode(vecCtx) {
+			logutil.Debugf("Auto mode: small dataset, selected 'force'")
+			return "force", isAutoMode, true
+		}
+
+		// Default to post mode for normal cases
+		logutil.Debugf("Auto mode: normal case, selected 'post'")
+		mode = "post"
+		return mode, isAutoMode, false
+	}
+
+	// 4. Handle explicitly specified pre/post mode
+	if userMode == "pre" || userMode == "post" {
+		return userMode, false, false
+	}
+
+	// 5. No mode specified: use default behavior
+	if enableVectorPrefilterByDefault {
+		mode = "pre"
+	} else {
+		mode = "post"
+	}
+
+	return mode, false, false
+}
+
+func (builder *QueryBuilder) calculateAdaptiveNprobe(baseNprobe int64, stats *plan.Stats, totalLists int64) int64 {
+	// 1. If no statistics or invalid selectivity, keep as is
+	if stats == nil || stats.Selectivity <= 0 || stats.Selectivity >= 1 {
+		return baseNprobe
+	}
+
+	// 2. Calculate compensation factor (square root smoothing)
+	// Square root is used to prevent nprobe from growing too fast and causing excessive overhead
+	compensation := math.Sqrt(1.0 / stats.Selectivity)
+
+	// 3. Calculate adaptive nprobe
+	adaptiveNprobe := int64(math.Ceil(float64(baseNprobe) * compensation))
+
+	// 4. Boundary handling: not less than base value, not more than total lists
+	adaptiveNprobe = max(adaptiveNprobe, baseNprobe)
+	adaptiveNprobe = min(adaptiveNprobe, totalLists)
+
+	return adaptiveNprobe
+}
+
+func buildIvfSearchColDefs(includeColumns []string, originalTableDef *plan.TableDef) []*plan.ColDef {
+	colDefs := DeepCopyColDefList(ivfflatplan.IVFFLATScanColDefs)
+	if len(includeColumns) == 0 || originalTableDef == nil {
+		return colDefs
+	}
+
+	for _, colName := range includeColumns {
+		colIdx, ok := originalTableDef.Name2ColIndex[colName]
+		if !ok {
+			continue
+		}
+		srcCol := originalTableDef.Cols[colIdx]
+		colDefs = append(colDefs, &plan.ColDef{
+			Name: catalog.SystemSI_IVFFLAT_IncludeColPrefix + colName,
+			Typ:  srcCol.Typ,
+		})
+	}
+
+	return colDefs
+}
+
+func buildIvfChildProjectionMap(childNode *plan.Node) map[[2]int32]*plan.Expr {
+	if childNode == nil || len(childNode.BindingTags) == 0 {
+		return nil
+	}
+
+	childMap := make(map[[2]int32]*plan.Expr, len(childNode.ProjectList))
+	for i, expr := range childNode.ProjectList {
+		childMap[[2]int32{childNode.BindingTags[0], int32(i)}] = DeepCopyExpr(expr)
+	}
+	return childMap
+}
+
+// ivfIndexOnlyBoundary picks the projection that bounds which base-table columns can
+// still be read after the rewrite, and the child whose tags its expressions resolve
+// through. An index-only scan drops the base scan entirely, so anything outside this
+// boundary would fail column remap ("Missing Column: t.v") at build time.
+//
+//   - project-anchored (`select ... from (order by dist limit k)`): the boundary is the
+//     PROJECT above the Top-K, resolved through the Top-K's child project.
+//   - sort-anchored (#25967 outer ORDER BY, #25974 join input): there is no project above
+//     the Top-K — consumers live further up and reference the sort's output. That output
+//     IS the Top-K's child project, so the child bounds them: a consumer can only read a
+//     column the derived table exposes. Its expressions are already in scan terms, so
+//     they resolve through no child map.
+//   - neither (the ORDER BY expression is the distance call itself, so the sort sits
+//     straight on the scan): nothing narrows the scan's columns, so decline.
+func ivfIndexOnlyBoundary(projNode, childNode *plan.Node) (boundaryProj, boundaryChild *plan.Node) {
+	if projNode != nil {
+		return projNode, childNode
+	}
+	if childNode != nil && childNode.NodeType == plan.Node_PROJECT {
+		return childNode, nil
+	}
+	return nil, nil
+}
+
+func collectRequiredColumns(
+	projNode, childNode, scanNode *plan.Node,
+	orderExpr *plan.Expr,
+	partPos int32,
+	origFuncName string,
+	vecLitArg *plan.Expr,
+) map[string]struct{} {
+	required := make(map[string]struct{})
+	if scanNode == nil || scanNode.TableDef == nil || len(scanNode.BindingTags) == 0 {
+		return required
+	}
+
+	scanTag := scanNode.BindingTags[0]
+	childMap := buildIvfChildProjectionMap(childNode)
+
+	if projNode != nil {
+		for _, expr := range projNode.ProjectList {
+			resolved := replaceColumnsForExpr(DeepCopyExpr(expr), childMap)
+			collectScanColumnsFromExpr(resolved, scanTag, partPos, origFuncName, vecLitArg, scanNode.TableDef, required)
+		}
+	}
+
+	if orderExpr != nil {
+		resolved := replaceColumnsForExpr(DeepCopyExpr(orderExpr), childMap)
+		collectScanColumnsFromExpr(resolved, scanTag, partPos, origFuncName, vecLitArg, scanNode.TableDef, required)
+	}
+
+	for _, expr := range scanNode.FilterList {
+		collectScanColumnsFromExpr(DeepCopyExpr(expr), scanTag, partPos, origFuncName, vecLitArg, scanNode.TableDef, required)
+	}
+
+	return required
+}
+
+func collectProjectedColumns(
+	projNode, childNode, scanNode *plan.Node,
+	partPos int32,
+	origFuncName string,
+	vecLitArg *plan.Expr,
+) map[string]struct{} {
+	projected := make(map[string]struct{})
+	if projNode == nil || scanNode == nil || scanNode.TableDef == nil || len(scanNode.BindingTags) == 0 {
+		return projected
+	}
+
+	scanTag := scanNode.BindingTags[0]
+	childMap := buildIvfChildProjectionMap(childNode)
+	for _, expr := range projNode.ProjectList {
+		resolved := replaceColumnsForExpr(DeepCopyExpr(expr), childMap)
+		collectScanColumnsFromExpr(resolved, scanTag, partPos, origFuncName, vecLitArg, scanNode.TableDef, projected)
+	}
+	return projected
+}
+
+// removeIvfCandidateImpliedNotNullFilter removes only a direct IS NOT NULL
+// predicate on the indexed vector column. A synchronous IVF scan never emits
+// a candidate for a NULL vector, so candidate membership already proves this
+// predicate. More complex expressions remain residual filters.
+func removeIvfCandidateImpliedNotNullFilter(
+	filters []*plan.Expr,
+	scanTag, partPos int32,
+) (remaining, removed []*plan.Expr) {
+	remaining = make([]*plan.Expr, 0, len(filters))
+	for _, filter := range filters {
+		if filter == nil {
+			remaining = append(remaining, filter)
+			continue
+		}
+		fn := filter.GetF()
+		if fn != nil && fn.Func != nil && len(fn.Args) == 1 &&
+			(fn.Func.ObjName == "isnotnull" || fn.Func.ObjName == "is_not_null") &&
+			exprIsCol(fn.Args[0], scanTag, partPos) {
+			removed = append(removed, filter)
+			continue
+		}
+		remaining = append(remaining, filter)
+	}
+	return remaining, removed
+}
+
+func collectScanColumnsFromExpr(expr *plan.Expr, scanTag, partPos int32, origFuncName string, vecLitArg *plan.Expr, tableDef *plan.TableDef, out map[string]struct{}) {
+	if expr == nil || tableDef == nil {
+		return
+	}
+
+	switch impl := expr.Expr.(type) {
+	case *plan.Expr_Col:
+		if colName, ok := vectorIndexColumnNameFromTableDef(impl.Col, tableDef, scanTag); ok {
+			out[colName] = struct{}{}
+		}
+	case *plan.Expr_F:
+		// Only a distance that will actually be rewritten to the table function's score column
+		// (same metric func + same query vector as the index/ORDER BY key) can be served without the
+		// base scan's vector column. A distance on a DIFFERENT vector or a different metric still needs
+		// the base column, so recurse to collect it — otherwise the base scan is wrongly dropped and
+		// column remap fails ("Missing Column: t.v"). Mirrors replaceDistFnInExpr's match. (#26961)
+		if isVectorDistanceExpr(expr, scanTag, partPos) && impl.F.Func.ObjName == origFuncName &&
+			sameQueryPayload(impl.F, scanTag, partPos, vecLitArg) {
+			return
+		}
+		for _, arg := range impl.F.Args {
+			collectScanColumnsFromExpr(arg, scanTag, partPos, origFuncName, vecLitArg, tableDef, out)
+		}
+	case *plan.Expr_List:
+		for _, sub := range impl.List.List {
+			collectScanColumnsFromExpr(sub, scanTag, partPos, origFuncName, vecLitArg, tableDef, out)
+		}
+	}
+}
+
+func canDoIndexOnlyScan(requiredCols map[string]struct{}, tableDef *plan.TableDef, includeColumns []string) bool {
+	if tableDef == nil || tableDef.Pkey == nil {
+		return false
+	}
+
+	covered := buildVectorIndexCoveredColumns(tableDef, includeColumns)
+	for col := range requiredCols {
+		if _, ok := covered[col]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func buildIvfScanToTableFuncMap(tableFuncTag int32, tableFuncIncludeColumns []string, scanNode *plan.Node) map[[2]int32]*plan.Expr {
+	if scanNode == nil || scanNode.TableDef == nil || len(scanNode.BindingTags) == 0 {
+		return nil
+	}
+
+	scanTag := scanNode.BindingTags[0]
+	projMap := make(map[[2]int32]*plan.Expr, len(tableFuncIncludeColumns)+1)
+	if scanNode.TableDef.Pkey != nil && len(scanNode.TableDef.Pkey.Names) == 1 {
+		pkPos := scanNode.TableDef.Name2ColIndex[scanNode.TableDef.Pkey.PkeyColName]
+		projMap[[2]int32{scanTag, pkPos}] = &plan.Expr{
+			Typ: scanNode.TableDef.Cols[pkPos].Typ,
+			Expr: &plan.Expr_Col{
+				Col: &plan.ColRef{
+					RelPos: tableFuncTag,
+					ColPos: 0,
+					Name:   "pkid",
+				},
+			},
+		}
+	}
+
+	for i, colName := range tableFuncIncludeColumns {
+		colPos, ok := scanNode.TableDef.Name2ColIndex[colName]
+		if !ok {
+			continue
+		}
+		projMap[[2]int32{scanTag, colPos}] = &plan.Expr{
+			Typ: scanNode.TableDef.Cols[colPos].Typ,
+			Expr: &plan.Expr_Col{
+				Col: &plan.ColRef{
+					RelPos: tableFuncTag,
+					ColPos: int32(2 + i),
+					Name:   catalog.SystemSI_IVFFLAT_IncludeColPrefix + colName,
+				},
+			},
+		}
+	}
+	return projMap
+}
+
+func firstIvfSearchRoundLimit(limit *plan.Expr, hasFilterPressure bool) uint64 {
+	if limit == nil || limit.GetLit() == nil {
+		return 0
+	}
+
+	originalLimit := limit.GetLit().GetU64Val()
+	if !hasFilterPressure {
+		return originalLimit
+	}
+
+	overFetchFactor := overfetch.FilteredPostModeFactor(originalLimit)
+	return overfetch.Limit(originalLimit, overFetchFactor)
+}
+
+func ensureIvfIncludeSearchRoundLimitAtLeastK(searchRoundLimit uint64, outerResultNeed *plan.Expr) uint64 {
+	if outerResultNeed == nil || outerResultNeed.GetLit() == nil {
+		return searchRoundLimit
+	}
+	if k := outerResultNeed.GetLit().GetU64Val(); searchRoundLimit < k {
+		return k
+	}
+	return searchRoundLimit
+}
+
+func (builder *QueryBuilder) prepareIvfIndexContext(vecCtx *vectorSortContext, multiTableIndex *MultiTableIndex) (*ivfIndexContext, error) {
+	if vecCtx == nil || multiTableIndex == nil {
+		return nil, nil
+	}
+	if vecCtx.distFnExpr == nil {
+		return nil, nil
+	}
+
+	if vecCtx.rankOption != nil && vecCtx.rankOption.Mode == "force" {
+		return nil, nil
+	}
+
+	rewriteAllowed, err := builder.validateVectorIndexSortRewrite(vecCtx)
+	if err != nil || !rewriteAllowed {
+		return nil, err
+	}
+
+	// Check if vector pre-filter pushdown should be enabled by default
+	// This session variable changes the default vector search behavior
+	var enableVectorPrefilterByDefault bool
+	if val, err := builder.compCtx.ResolveVariable("enable_vector_prefilter_by_default", true, false); err == nil && val != nil {
+		if v, ok := val.(int8); ok && v == 1 {
+			enableVectorPrefilterByDefault = true
+		}
+	}
+
+	var enableVectorAutoModeByDefault bool
+	if val, err := builder.compCtx.ResolveVariable("enable_vector_auto_mode_by_default", true, false); err == nil && val != nil {
+		if v, ok := val.(int8); ok && v == 1 {
+			enableVectorAutoModeByDefault = true
+		}
+	}
+
+	// Resolve vector search mode
+	mode, isAutoMode, shouldDisableIndex := builder.resolveVectorSearchMode(
+		vecCtx,
+		enableVectorPrefilterByDefault,
+		enableVectorAutoModeByDefault,
+	)
+
+	// An AUTO decision that selects the exact path is terminal for this region.
+	// Persist FORCE so the legacy statement-output retry owner cannot retry the
+	// unchanged AUTO AST forever (including implicit AUTO from session config).
+	if shouldDisableIndex {
+		if isAutoMode {
+			builder.forceAdaptiveVectorRegion(vecCtx)
+		}
+		return nil, nil
+	}
+
+	// Log auto mode activation
+	if isAutoMode {
+		logutil.Debugf("Vector search auto mode enabled, initial strategy: %s", mode)
+	}
+
+	metaDef := multiTableIndex.IndexDefs[catalog.SystemSI_IVFFLAT_TblType_Metadata]
+	idxDef := multiTableIndex.IndexDefs[catalog.SystemSI_IVFFLAT_TblType_Centroids]
+	entriesDef := multiTableIndex.IndexDefs[catalog.SystemSI_IVFFLAT_TblType_Entries]
+	if metaDef == nil || idxDef == nil || entriesDef == nil {
+		return nil, nil
+	}
+
+	params, err := decodeVectorIndexAlgoParams(metaDef.IndexAlgoParams)
+	if err != nil {
+		return nil, nil
+	}
+	opType, ok := vectorIndexStringParam(params, catalog.IndexAlgoParamOpType)
+	if !ok {
+		return nil, nil
+	}
+
+	// Get total lists for nprobe boundary handling
+	var totalLists int64 = -1
+	if lists, ok := vectorIndexInt64Param(params, catalog.IndexAlgoParamLists); ok {
+		totalLists = lists
+	}
+
+	origFuncName := vecCtx.distFnExpr.Func.ObjName
+	// An index serves this distance function when its op_type is metric-equivalent to the
+	// query's, not only when it is the canonical one — vector_l2_ops and vector_l2sq_ops
+	// build the same index and both answer l2_distance / l2_distance_sq (#25966).
+	if !metric.OpTypeServesDistFunc(opType, origFuncName) {
+		return nil, nil
+	}
+
+	if len(idxDef.Parts) == 0 {
+		return nil, nil
+	}
+	keyPart := idxDef.Parts[0]
+	partPos := vecCtx.scanNode.TableDef.Name2ColIndex[keyPart]
+	var vecLitArg *plan.Expr
+	var found bool
+	if vecCtx.vecArgExpr != nil {
+		_, vecLitArg, found = builder.getArgsFromDistFnForJoin(
+			vecCtx.distFnExpr,
+			partPos,
+			vecCtx.scanNode.BindingTags[0],
+		)
+	} else {
+		_, vecLitArg, found = builder.getArgsFromDistFn(vecCtx.distFnExpr, partPos)
+	}
+	if !found {
+		return nil, nil
+	}
+
+	nThread, err := builder.resolveInt64Variable("ivf_threads_search", 0)
+	if err != nil {
+		return nil, err
+	}
+
+	nProbe := int64(5)
+	if nProbeIf, err := builder.compCtx.ResolveVariable("probe_limit", true, false); err != nil {
+		return nil, err
+	} else if nProbeIf != nil {
+		val, ok := nProbeIf.(int64)
+		if !ok {
+			return nil, moerr.NewInternalErrorNoCtx("ResolveVariable: probe_limit is not int64")
+		}
+		nProbe = val
+	}
+
+	// Dynamically amplify nprobe for auto mode.
+	// Only applied if mode is "post" (pushdown disabled) and totalLists is available
+	if isAutoMode && mode == "post" && totalLists > 0 {
+		oldNProbe := nProbe
+		nProbe = builder.calculateAdaptiveNprobe(
+			nProbe,
+			vecCtx.scanNode.Stats,
+			totalLists,
+		)
+		if nProbe != oldNProbe {
+			logutil.Debugf("Auto mode: adjusted nprobe from %d to %d (selectivity: %.4f)",
+				oldNProbe, nProbe, vecCtx.scanNode.Stats.Selectivity)
+		}
+	}
+
+	pkPos := vecCtx.scanNode.TableDef.Name2ColIndex[vecCtx.scanNode.TableDef.Pkey.PkeyColName]
+	pkType := vecCtx.scanNode.TableDef.Cols[pkPos].Typ
+	partType := vecCtx.scanNode.TableDef.Cols[partPos].Typ
+	quantization, _ := vectorIndexStringParam(params, catalog.Quantization)
+	entryType, quantized := quantizer.ToVectorType(quantization)
+	lossyEntries := quantized && (entryType != types.T(partType.Id) ||
+		entryType == types.T_array_int8 || entryType == types.T_array_uint8)
+
+	return &ivfIndexContext{
+		vecCtx:          vecCtx,
+		metaDef:         metaDef,
+		idxDef:          idxDef,
+		entriesDef:      entriesDef,
+		vecLitArg:       vecLitArg,
+		origFuncName:    origFuncName,
+		partPos:         partPos,
+		partType:        partType,
+		pkPos:           pkPos,
+		pkType:          pkType,
+		lossyEntries:    lossyEntries,
+		nThread:         nThread,
+		nProbe:          nProbe,
+		totalLists:      totalLists,
+		pushdownEnabled: (mode == "pre"),
+
+		// Auto mode fields.
+		isAutoMode:      isAutoMode,
+		initialStrategy: mode,
+	}, nil
+}
+
+func (builder *QueryBuilder) applyIndicesForSortUsingIvfflat(nodeID int32, vecCtx *vectorSortContext, multiTableIndex *MultiTableIndex, colRefCnt map[[2]int32]int, idxColMap map[[2]int32]*plan.Expr) (int32, error) {
+	return builder.applyIndicesForSortUsingIvfflatWithContext(nodeID, vecCtx, multiTableIndex, colRefCnt, idxColMap, nil)
+}
+
+func (builder *QueryBuilder) applyIndicesForSortUsingIvfflatWithContext(
+	nodeID int32,
+	vecCtx *vectorSortContext,
+	multiTableIndex *MultiTableIndex,
+	colRefCnt map[[2]int32]int,
+	idxColMap map[[2]int32]*plan.Expr,
+	prepared *ivfIndexContext,
+) (int32, error) {
+	if !hasCompleteVectorPagination(vecCtx) || vecCtx.sortNode == nil || vecCtx.scanNode == nil {
+		return nodeID, nil
+	}
+
+	ctx := builder.ctxByNode[nodeID]
+	projNode := vecCtx.projNode
+	sortNode := vecCtx.sortNode
+	scanNode := vecCtx.scanNode
+	childNode := vecCtx.childNode
+	orderExpr := vecCtx.orderExpr
+	limit := vecCtx.limit
+
+	// AUTO regions that already select an exact scan must stop advertising AUTO
+	// to the legacy statement-output retry owner. Replay-unsafe expressions must
+	// likewise execute exactly once; discarded candidate batches cannot roll back
+	// sequence allocations or other volatile evaluation.
+	if vectorRankMode(vecCtx) == "auto" &&
+		(builder.shouldUseForceMode(vecCtx) || !builder.adaptiveIvfReplaySafe(nodeID)) {
+		builder.forceAdaptiveVectorRegion(vecCtx)
+		return nodeID, nil
+	}
+
+	ivfCtx := prepared
+	if ivfCtx == nil {
+		var err error
+		ivfCtx, err = builder.prepareIvfIndexContext(vecCtx, multiTableIndex)
+		if err != nil || ivfCtx == nil {
+			return nodeID, err
+		}
+	}
+	// The vector scan truncates its candidate stream before any residual
+	// table-scan predicate can run.  If an indexed distance predicate remains
+	// after range extraction, keeping the rewrite would silently discard
+	// qualifying rows outside that candidate prefix.  Apply this fail-closed
+	// check to both exact and lossy index entries: lossy scores cannot prove
+	// exact SQL distance predicates safe after truncation.  Extract from a
+	// private copy because getDistRangeFromFilters compacts its input slice in
+	// place; AUTO must make this decision before it builds adaptive branches.
+	if len(scanNode.BindingTags) > 0 {
+		filterCopy := DeepCopyExprList(scanNode.FilterList)
+		remaining := filterCopy
+		if !ivfCtx.lossyEntries {
+			remaining, _ = builder.getDistRangeFromFilters(
+				filterCopy, ivfCtx.partPos, ivfCtx.origFuncName, ivfCtx.vecLitArg,
+				scanNode.BindingTags[0])
+		}
+		if filtersContainIndexedDistanceExpr(
+			remaining, scanNode.BindingTags[0], ivfCtx.partPos,
+			ivfCtx.origFuncName, ivfCtx.vecLitArg,
+		) {
+			if ivfCtx.isAutoMode && prepared == nil {
+				builder.forceAdaptiveVectorRegion(vecCtx)
+			}
+			return nodeID, nil
+		}
+	}
+	if ivfCtx.isAutoMode && prepared == nil {
+		return builder.buildAdaptiveIvfTop(nodeID, vecCtx, multiTableIndex, colRefCnt, idxColMap, ivfCtx)
+	}
+
+	// Persist the inferred auto mode back to the plan nodes so downstream
+	// adaptive-vector-search checks see the same mode consistently.
+	if ivfCtx.isAutoMode && (vecCtx.rankOption == nil || vecCtx.rankOption.Mode == "") {
+		if vecCtx.rankOption == nil {
+			vecCtx.rankOption = &plan.RankOption{}
+		}
+		vecCtx.rankOption.Mode = "auto"
+
+		// Sync back to nodes
+		if sortNode.RankOption == nil {
+			sortNode.RankOption = vecCtx.rankOption
+		}
+		if scanNode.RankOption == nil {
+			scanNode.RankOption = vecCtx.rankOption
+		}
+		if projNode != nil && projNode.RankOption == nil {
+			projNode.RankOption = vecCtx.rankOption
+		}
+	}
+
+	// Lossy entries can round or clip distinct source distances to the same
+	// score. Keep their distance predicates on the source scan; encoded scores
+	// still order bounded ANN candidates, but cannot decide exact SQL predicates.
+	newFilterList := scanNode.FilterList
+	var distRange *plan.DistRange
+	if !ivfCtx.lossyEntries {
+		newFilterList, distRange = builder.getDistRangeFromFilters(
+			newFilterList, ivfCtx.partPos, ivfCtx.origFuncName, ivfCtx.vecLitArg,
+			scanNode.BindingTags[0])
+	}
+	includeColumns, err := getVectorIndexIncludedColumns(multiTableIndex)
+	if err != nil {
+		return 0, err
+	}
+	// An explicit POST query normally keeps its approximate, single-round
+	// behavior. When its predicate is covered by an INCLUDE column, however,
+	// an empty first-round page is ambiguous: the matching row may be in a
+	// later centroid. Build a subtree-local exact fallback for that narrow
+	// case. The prepared context prevents the POST candidate from recursively
+	// rebuilding the fallback while it is being materialized.
+	coveredFilters, _ := splitFiltersByVectorIndexCoverage(
+		newFilterList, scanNode, includeColumns, ivfCtx.partPos)
+	if prepared == nil && len(includeColumns) > 0 && vecCtx.rankOption != nil &&
+		vecCtx.rankOption.Mode == "post" && len(coveredFilters) > 0 &&
+		hasVectorIndexIncludedColumnFilter(coveredFilters, scanNode, includeColumns) &&
+		builder.adaptiveIvfTopSupported(nodeID, vecCtx, true) {
+		return builder.buildAdaptiveIvfTopWithPolicy(
+			nodeID, vecCtx, multiTableIndex, colRefCnt, idxColMap, ivfCtx, true)
+	}
+	includeAwareColumns := includeColumns
+	// The local POST candidate is annotated as explicit POST to prevent nested
+	// adaptive construction, but it still owns the AUTO resolution semantics.
+	// Preserve AUTO's include-aware index-only eligibility from the prepared
+	// context. A user-written explicit POST keeps its historical behavior.
+	preserveAutoInclude := prepared != nil && ivfCtx.isAutoMode
+	if vecCtx.rankOption != nil && !preserveAutoInclude {
+		switch vecCtx.rankOption.Mode {
+		case "", "include", "auto":
+		default:
+			includeAwareColumns = nil
+		}
+	}
+	// Both maps exist only to decide (and populate) an index-only scan, which needs a
+	// projection that bounds every column a consumer can still read. Resolve that
+	// boundary once; a nil boundary means "unknown", and index-only stays off.
+	boundaryProj, boundaryChild := ivfIndexOnlyBoundary(projNode, childNode)
+	var requiredCols, projectedCols map[string]struct{}
+	if boundaryProj != nil {
+		requiredCols = collectRequiredColumns(boundaryProj, boundaryChild, scanNode, orderExpr, ivfCtx.partPos, ivfCtx.origFuncName, ivfCtx.vecLitArg)
+		projectedCols = collectProjectedColumns(boundaryProj, boundaryChild, scanNode, ivfCtx.partPos, ivfCtx.origFuncName, ivfCtx.vecLitArg)
+	}
+	coveragePushdown, _ := splitFiltersByVectorIndexCoverage(newFilterList, scanNode, includeAwareColumns, ivfCtx.partPos)
+	typedPushdownFilters := coveragePushdown
+	remainingFilters := make([]*plan.Expr, 0, len(newFilterList)-len(typedPushdownFilters))
+	pushdownSet := make(map[*plan.Expr]struct{}, len(typedPushdownFilters))
+	for _, expr := range typedPushdownFilters {
+		pushdownSet[expr] = struct{}{}
+	}
+	for _, expr := range newFilterList {
+		if _, ok := pushdownSet[expr]; ok {
+			continue
+		}
+		remainingFilters = append(remainingFilters, expr)
+	}
+	asyncIndex, err := catalog.IndexParamAsync(ivfCtx.metaDef.IndexAlgoParams)
+	if err != nil {
+		return nodeID, err
+	}
+	// Multi-round search may stop on a candidate count only when the index scan has
+	// observed every filter. Keep residual predicates on the membership-filter
+	// topology and use the bounded, legacy-compatible single-round IVF search.
+	includeModeFallbackToPre := vecCtx.rankOption != nil && vecCtx.rankOption.Mode == "include" && len(remainingFilters) > 0
+	usePreFilter := ivfCtx.pushdownEnabled || includeModeFallbackToPre
+	if !asyncIndex && !usePreFilter {
+		var removedFilters []*plan.Expr
+		remainingFilters, removedFilters = removeIvfCandidateImpliedNotNullFilter(
+			remainingFilters, scanNode.BindingTags[0], ivfCtx.partPos)
+		// colRefCnt was computed before index rewrites. Keep it consistent with
+		// FilterList so the remapper can prune the wide vector column.
+		if colRefCnt != nil && len(removedFilters) > 0 {
+			key := [2]int32{scanNode.BindingTags[0], ivfCtx.partPos}
+			if count := colRefCnt[key]; count > len(removedFilters) {
+				colRefCnt[key] = count - len(removedFilters)
+			} else {
+				colRefCnt[key] = 0
+			}
+		}
+	}
+	canIndexOnly := !vecCtx.hasMembership && boundaryProj != nil &&
+		canDoIndexOnlyScan(requiredCols, scanNode.TableDef, includeAwareColumns) && len(remainingFilters) == 0
+	tableFuncIncludeColumns := make([]string, 0, len(includeAwareColumns))
+	if canIndexOnly {
+		for _, col := range includeAwareColumns {
+			if _, ok := projectedCols[col]; ok {
+				tableFuncIncludeColumns = append(tableFuncIncludeColumns, col)
+			}
+		}
+	}
+
+	// vectorSortContext.limit is the semantic outer LIMIT+OFFSET window. Keep it
+	// unchanged in the reusable plan; execution binding derives any candidate
+	// over-fetch budget after prepared parameters are available.
+	outerResultNeedExpr := DeepCopyExpr(limit)
+	// Both post mode and membership pre mode can discard vector candidates
+	// after the bounded index search. Give either path the same tapered
+	// candidate budget while preserving the semantic outer LIMIT.
+	postFilterOverFetch := len(remainingFilters) > 0
+
+	firstRoundLimit := uint64(0)
+	var firstRoundLimitExpr *plan.Expr
+	bucketExpandStep := uint64(0)
+	if vecCtx.rankOption != nil && vecCtx.rankOption.Mode == "include" && !includeModeFallbackToPre {
+		firstRoundLimit = firstIvfSearchRoundLimit(outerResultNeedExpr, len(typedPushdownFilters) > 0)
+		firstRoundLimit = ensureIvfIncludeSearchRoundLimitAtLeastK(firstRoundLimit, outerResultNeedExpr)
+		if firstRoundLimit > 0 {
+			firstRoundLimitExpr = makePlan2Uint64ConstExprWithType(firstRoundLimit)
+		} else if outerResultNeedExpr != nil {
+			// A prepared LIMIT must remain an execution-time expression. Using a
+			// plan-time fallback of one truncates the only populated centroid and
+			// cannot be repaired by expanding into unrelated centroid buckets.
+			firstRoundLimitExpr = DeepCopyExpr(outerResultNeedExpr)
+		}
+		bucketExpandStep = uint64(ivfCtx.nProbe)
+		if bucketExpandStep == 0 {
+			bucketExpandStep = 1
+		}
+	}
+	typedPreFilters := rebindIvfPreFilters(typedPushdownFilters, scanNode, includeColumns)
+	algoOptions, err := ivfflatplan.EncodeScanOptions(ivfflatplan.ScanOptions{
+		InitialProbeCount: uint32(ivfCtx.nProbe),
+		BucketExpandStep:  uint32(bucketExpandStep),
+		ThreadsSearch:     ivfCtx.nThread,
+	})
+	if err != nil {
+		return 0, err
+	}
+	var algoExprs []*plan.Expr
+	var algoExprNames []string
+	if firstRoundLimitExpr != nil {
+		algoExprs = []*plan.Expr{firstRoundLimitExpr}
+		algoExprNames = []string{ivfflatplan.FirstRoundLimitExpr}
+	}
+
+	// Build an optimizer-visible vector-index access path.  The hidden table
+	// references are resolved by name on the execution CN in the same txn; no
+	// generated SQL or nested plan is needed.
+	tableFuncTag := builder.genNewBindTag()
+	tableFuncNode := &plan.Node{
+		NodeType: plan.Node_INDEX_SEARCH_SCAN,
+		// Async index payload may be committed locally before every CN has
+		// replayed the corresponding object metadata. Keep search on one CN
+		// until the async path provides a global visibility watermark.
+		Stats:  &plan.Stats{ForceOneCN: asyncIndex},
+		ObjRef: DeepCopyObjectRef(scanNode.ObjRef),
+		// Keep the generic node snapshot in sync with the vector-specific
+		// specification.  The compiler uses the node-level field to choose the
+		// transaction and context for every scan datasource.
+		ScanSnapshot: DeepCopySnapshot(scanNode.ScanSnapshot),
+		TableDef: &plan.TableDef{
+			Name:      scanNode.TableDef.Name,
+			TableType: "vector_index_scan",
+			Cols:      buildIvfSearchColDefs(tableFuncIncludeColumns, scanNode.TableDef),
+		},
+		BindingTags: []int32{tableFuncTag},
+		Children:    vectorSearchProviderChildren(vecCtx),
+		IndexSearchScan: &plan.IndexSearchScan{
+			SourceTable:         DeepCopyObjectRef(scanNode.ObjRef),
+			SourceTableDef:      DeepCopyTableDef(scanNode.TableDef, true),
+			ScanSnapshot:        DeepCopySnapshot(scanNode.ScanSnapshot),
+			Index:               DeepCopyIndexDef(ivfCtx.metaDef),
+			QueryPayload:        DeepCopyExpr(ivfCtx.vecLitArg),
+			DistanceFunction:    ivfCtx.origFuncName,
+			Direction:           vecCtx.sortDirection,
+			DistanceRange:       DeepCopyDistRange(distRange),
+			PreFilters:          typedPreFilters,
+			IncludedColumns:     append([]string(nil), tableFuncIncludeColumns...),
+			AlgoOptions:         algoOptions,
+			AlgoExprs:           algoExprs,
+			AlgoExprNames:       algoExprNames,
+			PostFilterOverFetch: postFilterOverFetch,
+			HiddenTables: []*plan.IndexHiddenTableRef{
+				{Role: catalog.SystemSI_IVFFLAT_TblType_Metadata, Object: &plan.ObjectRef{SchemaName: scanNode.ObjRef.SchemaName, ObjName: ivfCtx.metaDef.IndexTableName}},
+				{Role: catalog.SystemSI_IVFFLAT_TblType_Centroids, Object: &plan.ObjectRef{SchemaName: scanNode.ObjRef.SchemaName, ObjName: ivfCtx.idxDef.IndexTableName}},
+				{Role: catalog.SystemSI_IVFFLAT_TblType_Entries, Object: &plan.ObjectRef{SchemaName: scanNode.ObjRef.SchemaName, ObjName: ivfCtx.entriesDef.IndexTableName}},
+			},
+		},
+	}
+	tableFuncNodeID := builder.appendNode(tableFuncNode, ctx)
+
+	err = builder.addBinding(tableFuncNodeID, tree.AliasClause{
+		Alias: tree.Identifier(fmt.Sprintf("mo_ivf_alias_%d", tableFuncNodeID)),
+	}, ctx, "")
+	if err != nil {
+		return 0, err
+	}
+	candidateNodeID := tableFuncNodeID
+	if len(tableFuncNode.Children) == 1 {
+		providerNodeID := tableFuncNode.Children[0]
+		tableFuncNode.Children = nil
+		candidateNodeID = builder.appendNode(&plan.Node{
+			NodeType:  plan.Node_APPLY,
+			Children:  []int32{providerNodeID, tableFuncNodeID},
+			ApplyType: plan.Node_CROSSAPPLY,
+			Stats:     DeepCopyStats(tableFuncNode.Stats),
+		}, ctx)
+	}
+
+	// change doc_id type to the primary type here
+	tableFuncNode.TableDef.Cols[0].Typ = ivfCtx.pkType
+
+	// Preserve semantic k in the plan for both literal and prepared executions.
+	limitExpr := DeepCopyExpr(outerResultNeedExpr)
+
+	tableFuncNode.IndexSearchScan.CandidateLimit = DeepCopyExpr(limitExpr)
+	if tableFuncNode.Stats == nil {
+		tableFuncNode.Stats = DefaultStats()
+	}
+	if scanNode.Stats != nil && scanNode.Stats.TableCnt > 0 {
+		fraction := 1.0
+		if ivfCtx.totalLists > 0 {
+			fraction = math.Min(1, float64(max(int64(1), ivfCtx.nProbe))/float64(ivfCtx.totalLists))
+		}
+		tableFuncNode.Stats.TableCnt = scanNode.Stats.TableCnt
+		tableFuncNode.Stats.Cost = math.Max(1, scanNode.Stats.TableCnt*fraction)
+		tableFuncNode.Stats.BlockNum = max(int32(1), int32(math.Ceil(float64(scanNode.Stats.BlockNum)*fraction)))
+		tableFuncNode.Stats.Rowsize = GetRowSizeFromTableDef(tableFuncNode.TableDef, true)
+	}
+	if lit := limitExpr.GetLit(); lit != nil && !lit.Isnull {
+		if value, ok := lit.Value.(*plan.Literal_U64Val); ok {
+			candidateBudget := value.U64Val
+			if postFilterOverFetch {
+				candidateBudget = overfetch.FilteredPostModeLimit(value.U64Val)
+			}
+			outcnt := float64(candidateBudget)
+			tableFuncNode.Stats.Outcnt = outcnt
+			tableFuncNode.Stats.Selectivity = safeSelectivityRatio(outcnt, tableFuncNode.Stats.TableCnt)
+		}
+	}
+	tableFuncNode.Stats.ForceOneCN = asyncIndex
+
+	// Determine join structure based on the effective filtering strategy:
+	//   no pre-filter: JOIN(scanNode, vectorScan)
+	//   pre-filter:    JOIN(scanNode, SEMI(vectorScan, secondScan))
+	var joinRootID int32
+
+	pushdownEnabled := vecCtx.hasMembership || (usePreFilter && len(remainingFilters) > 0)
+	scanNode.FilterList = remainingFilters
+
+	if canIndexOnly {
+		joinRootID = candidateNodeID
+	} else if pushdownEnabled {
+		// secondScanNode: copy original scanNode for JOIN(ivf, table)
+		secondScanNodeID := builder.copyNode(ctx, scanNode.NodeId)
+		secondScanNode := builder.qry.Nodes[secondScanNodeID]
+		oldTag := secondScanNode.BindingTags[0]
+		builder.rebindScanNode(secondScanNode)
+		newTag := secondScanNode.BindingTags[0]
+
+		// The copied scan is an internal producer. Keep its regular-index remaps local so
+		// they cannot affect the original row-fetch side, while preserving any mappings
+		// already published for the original scan tag.
+		secondIdxColMap := make(map[[2]int32]*plan.Expr)
+		if oldTag != newTag {
+			for key, value := range idxColMap {
+				if key[0] == oldTag {
+					secondIdxColMap[[2]int32{newTag, key[1]}] = DeepCopyExpr(value)
+				}
+			}
+		}
+
+		var originalMembershipNode *plan.Node
+		if vecCtx.hasMembership {
+			originalMembershipNode = builder.qry.Nodes[vecCtx.membershipNodeID]
+			if originalMembershipNode.NodeType != plan.Node_JOIN || originalMembershipNode.JoinType != plan.Node_SEMI ||
+				len(originalMembershipNode.Children) != 2 || originalMembershipNode.Children[0] != scanNode.NodeId {
+				return nodeID, nil
+			}
+		}
+
+		if builder.canApplyRegularIndex(secondScanNode) {
+			// Membership is enforced before candidate Top-K. Only predicates implied
+			// by synchronous IVF candidates may be removed from its producer.
+			if !asyncIndex {
+				secondScanNode.FilterList, _ = removeIvfCandidateImpliedNotNullFilter(
+					secondScanNode.FilterList, newTag, ivfCtx.partPos)
+			}
+
+			// Retained predicates must participate in column-use accounting.
+			secondColRefCnt := make(map[[2]int32]int)
+			secondColRefCnt[[2]int32{newTag, ivfCtx.pkPos}] = 1
+			for _, expr := range secondScanNode.FilterList {
+				extractColRefs(expr, newTag, secondColRefCnt)
+			}
+			// A covering-index decision must account for every left-side column that
+			// the copied membership JOIN will consume after this scan is optimized.
+			if originalMembershipNode != nil {
+				for _, expr := range originalMembershipNode.OnList {
+					rebound := DeepCopyExpr(expr)
+					replaceColRefTag(rebound, oldTag, newTag)
+					extractColRefs(rebound, newTag, secondColRefCnt)
+				}
+			}
+			optimizedSecondScanID := builder.applyIndicesForFilters(
+				secondScanNodeID, secondScanNode, secondColRefCnt, secondIdxColMap)
+			secondScanNodeID = optimizedSecondScanID
+		}
+
+		// Otherwise the runtime filter will only see the truncated primary key set, causing data loss.
+		// Clear candidate limits only from the copied indexed-table side. A membership subquery may
+		// have its own semantic LIMIT/OFFSET, which must remain intact.
+		clearLimitOffsetInSubtree(builder.qry, secondScanNodeID)
+
+		membershipProducerID := secondScanNodeID
+		if originalMembershipNode != nil {
+			membershipNode := DeepCopyNode(originalMembershipNode)
+			membershipNode.Children[0] = secondScanNodeID
+			membershipNode.Limit = nil
+			membershipNode.Offset = nil
+			for _, expr := range membershipNode.OnList {
+				replaceColRefTag(expr, oldTag, newTag)
+			}
+			// An index-only rewrite replaces the copied scan tag with hidden-index
+			// output expressions. Rebind every membership expression to that output.
+			replaceColumnsForNode(membershipNode, secondIdxColMap)
+			membershipProducerID = builder.appendNode(membershipNode, ctx)
+		}
+
+		// Add a PROJECT above the filtered relation to output only the primary key column.
+		secondProjectTag := builder.genNewBindTag()
+		secondPkExpr := builder.buildPkExprFromNode(membershipProducerID, ivfCtx.pkType, scanNode.TableDef.Pkey.PkeyColName)
+		if secondPkExpr == nil {
+			// If an optimized second-scan subtree can't provide a stable PK expression,
+			// skip IVF rewrite to avoid wiring stale bindings into join/runtime-filter paths.
+			return nodeID, nil
+		}
+		secondProjectNodeID := builder.appendNode(&plan.Node{
+			NodeType:    plan.Node_PROJECT,
+			Children:    []int32{membershipProducerID},
+			ProjectList: []*plan.Expr{secondPkExpr},
+			BindingTags: []int32{secondProjectTag},
+		}, ctx)
+
+		// membership SEMI join: (vector scan SEMI JOIN second table project)
+		innerJoinOn, _ := BindFuncExprImplByPlanExpr(builder.GetContext(), "=", []*Expr{
+			{
+				Typ: ivfCtx.pkType,
+				Expr: &plan.Expr_Col{
+					Col: &plan.ColRef{
+						RelPos: tableFuncTag,
+						ColPos: 0, // tf.pkid
+					},
+				},
+			},
+			{
+				Typ: ivfCtx.pkType,
+				Expr: &plan.Expr_Col{
+					Col: &plan.ColRef{
+						RelPos: secondProjectTag,
+						ColPos: 0, // only pk column from second scan
+					},
+				},
+			},
+		})
+
+		innerJoinNodeID := builder.appendNode(&plan.Node{
+			NodeType: plan.Node_JOIN,
+			Children: []int32{candidateNodeID, secondProjectNodeID},
+			// The filtered relation is only a membership producer; none of its
+			// columns escape this node. SEMI is both the exact relational shape
+			// and an optimizer barrier that prevents the runtime-filter producer
+			// from being flattened into a three-way INNER join with its consumer.
+			JoinType: plan.Node_SEMI,
+			OnList:   []*Expr{innerJoinOn},
+			// Don't set Limit/Offset on JOIN - they should be applied after SORT
+		}, ctx)
+
+		// Construct BloomFilter type runtime filter for inner join + table function
+		rfTag := builder.genNewMsgTag()
+
+		// build side: primary key from secondScanNode (consistent with BloomFilter build column)
+		buildExpr := &plan.Expr{
+			Typ: ivfCtx.pkType,
+			Expr: &plan.Expr_Col{
+				Col: &plan.ColRef{
+					RelPos: secondProjectTag,
+					ColPos: 0,
+				},
+			},
+		}
+		buildSpec := MakeRuntimeFilter(rfTag, false, 0, buildExpr, false)
+		buildSpec.UseMembershipFilter = true
+		requiredDomain := vecCtx.hasMembership || candidateNodeID == tableFuncNodeID
+		buildSpec.MustApply = requiredDomain
+		innerJoinNode := builder.qry.Nodes[innerJoinNodeID]
+		innerJoinNode.RuntimeFilterBuildList = []*plan.RuntimeFilterSpec{buildSpec}
+
+		// probe side: pkid column from table function
+		probeExpr := &plan.Expr{
+			Typ: ivfCtx.pkType,
+			Expr: &plan.Expr_Col{
+				Col: &plan.ColRef{
+					RelPos: tableFuncTag,
+					ColPos: 0,
+				},
+			},
+		}
+		probeSpec := MakeRuntimeFilter(rfTag, false, 0, probeExpr, false)
+		probeSpec.UseMembershipFilter = true
+		probeSpec.MustApply = requiredDomain
+		tableFuncNode.RuntimeFilterProbeList = []*plan.RuntimeFilterSpec{probeSpec}
+		// The final placement proof decides whether every CN can receive the
+		// complete domain. Unproved shapes retain the local execution restriction.
+		tableFuncNode.Stats.ForceOneCN = true
+		if !asyncIndex && candidateNodeID == tableFuncNodeID && requiredDomain &&
+			bucketExpandStep == 0 && firstRoundLimitExpr == nil &&
+			types.T(ivfCtx.pkType.Id).IsInteger() {
+			work, workErr := builder.estimateIvfScanWork(scanNode.ObjRef, scanNode.ScanSnapshot,
+				ivfCtx.entriesDef.IndexTableName, ivfCtx.totalLists, ivfCtx.nProbe)
+			if workErr != nil {
+				return nodeID, workErr
+			}
+			tableFuncNode.IndexSearchScan.ScanWork = work
+		}
+
+		// The original scan was guarded during the recursive planner pass so the vector rewrite
+		// could see the raw table scan shape. Once the IVF subtree is constructed, we can
+		// temporarily suspend that protection and apply regular secondary-index optimization
+		// to the row-fetch side of the outer join.
+		outerScanNodeID := scanNode.NodeId
+		if builder.canApplyRegularIndex(scanNode) {
+			builder.withSuspendedScanProtection(scanNode.NodeId, func() {
+				outerScanNodeID = builder.applyIndicesForFilters(scanNode.NodeId, scanNode, colRefCnt, idxColMap)
+			})
+		}
+
+		outerPkExpr := builder.buildPkExprFromNode(outerScanNodeID, ivfCtx.pkType, scanNode.TableDef.Pkey.PkeyColName)
+		if outerPkExpr == nil && outerScanNodeID != scanNode.NodeId {
+			// If a future regular-index rewrite produces an unsupported subtree shape,
+			// fall back to the original scan instead of wiring stale bindings into the IVF join.
+			logutil.Debugf("IVF outer PK fallback: optimized node %d -> original scan %d", outerScanNodeID, scanNode.NodeId)
+			outerScanNodeID = scanNode.NodeId
+			outerPkExpr = builder.buildPkExprFromNode(outerScanNodeID, ivfCtx.pkType, scanNode.TableDef.Pkey.PkeyColName)
+		}
+		if outerPkExpr == nil {
+			return nodeID, nil
+		}
+
+		// outer join: optimized outer subtree JOIN (inner ivf join)
+		outerOn, _ := BindFuncExprImplByPlanExpr(builder.GetContext(), "=", []*Expr{
+			DeepCopyExpr(outerPkExpr),
+			{
+				Typ: ivfCtx.pkType,
+				Expr: &plan.Expr_Col{
+					Col: &plan.ColRef{
+						RelPos: tableFuncTag, // tf pkid from inner join subtree
+						ColPos: 0,
+					},
+				},
+			},
+		})
+
+		outerJoinNodeID := builder.appendNode(&plan.Node{
+			NodeType: plan.Node_JOIN,
+			Children: []int32{outerScanNodeID, innerJoinNodeID},
+			JoinType: plan.Node_INNER,
+			OnList:   []*Expr{outerOn},
+			// Don't set Limit/Offset on JOIN - they should be applied after SORT
+		}, ctx)
+
+		// Outer join doesn't add extra project, let global column pruning optimizer handle it
+		joinRootID = outerJoinNodeID
+	} else {
+		outerScanNodeID := scanNode.NodeId
+		outerPkExpr := builder.buildPkExprFromNode(outerScanNodeID, ivfCtx.pkType, scanNode.TableDef.Pkey.PkeyColName)
+		if outerPkExpr == nil || outerPkExpr.GetCol() == nil {
+			return nodeID, nil
+		}
+
+		// JOIN( table, ivf )
+		wherePkEqPk, _ := BindFuncExprImplByPlanExpr(builder.GetContext(), "=", []*Expr{
+			{
+				Typ: ivfCtx.pkType,
+				Expr: &plan.Expr_Col{
+					Col: &plan.ColRef{
+						RelPos: outerPkExpr.GetCol().RelPos,
+						ColPos: outerPkExpr.GetCol().ColPos, // tbl.pk
+					},
+				},
+			},
+			{
+				Typ: ivfCtx.pkType,
+				Expr: &plan.Expr_Col{
+					Col: &plan.ColRef{
+						RelPos: tableFuncTag,
+						ColPos: 0, // tf.pkid
+					},
+				},
+			},
+		})
+
+		joinNodeID := builder.appendNode(&plan.Node{
+			NodeType: plan.Node_JOIN,
+			Children: []int32{outerScanNodeID, candidateNodeID},
+			JoinType: plan.Node_INNER,
+			OnList:   []*Expr{wherePkEqPk},
+			// Don't set Limit/Offset on JOIN - they should be applied after SORT
+		}, ctx)
+
+		// In non-nested mode, outer join also doesn't add extra project, let optimizer handle column pruning
+		joinRootID = joinNodeID
+	}
+
+	if !canIndexOnly {
+		// Keep residual filters on scanNode so they are applied during table scan.
+		scanNode.Limit = nil
+		scanNode.Offset = nil
+	}
+
+	// Rewrite SELECT-side distance sub-expressions on the base scan's vector column to reference the
+	// table function's score column. Without this, a distance WRAPPED by a scalar (CAST/ROUND/
+	// arithmetic) or bound to an alias keeps an orphaned ColRef to the base scan's vector column,
+	// which the base-scan removal then cannot remap ("cannot find column reference"): issue #26961.
+	// It also avoids re-running the distance kernel per scanned row. Shared with cagra/ivfpq (the
+	// helper's query-vec literal match is robust to the SELECT-side unfolded cast('[...]')).
+	{
+		scanTag := scanNode.BindingTags[0]
+		scoreColType := tableFuncNode.TableDef.Cols[1].Typ // table function's score column
+		if projNode != nil {
+			replaceDistFnExprsWithScoreCol(projNode.ProjectList, scanTag,
+				ivfCtx.partPos, ivfCtx.origFuncName, ivfCtx.vecLitArg, tableFuncTag, scoreColType)
+		}
+		if childNode != nil {
+			replaceDistFnExprsWithScoreCol(childNode.ProjectList, scanTag,
+				ivfCtx.partPos, ivfCtx.origFuncName, ivfCtx.vecLitArg, tableFuncTag, scoreColType)
+		}
+	}
+
+	// Create SortBy, still sort directly by table function's score, let remap map ColRef to corresponding output column
+	orderByScore := []*OrderBySpec{
+		{
+			Expr: &plan.Expr{
+				Typ: tableFuncNode.TableDef.Cols[1].Typ, // score column
+				Expr: &plan.Expr_Col{
+					Col: &plan.ColRef{
+						RelPos: tableFuncTag,
+						ColPos: 1, // score column
+					},
+				},
+			},
+			Flag: vecCtx.sortDirection,
+		},
+	}
+	resultLimit, resultOffset := vectorResultPagination(vecCtx)
+
+	sortByID := builder.appendNode(&plan.Node{
+		NodeType:   plan.Node_SORT,
+		Children:   []int32{joinRootID},
+		OrderBy:    orderByScore,
+		Limit:      resultLimit,
+		Offset:     resultOffset,
+		RankOption: DeepCopyRankOption(vecCtx.rankOption),
+		SpillMem:   builder.sortSpillMem,
+	}, ctx)
+
+	// Anchored at the PROJECT above the Top-K, or at the Top-K sort itself when a
+	// consumer (outer ORDER BY, join) sits between it and any project. Under an
+	// index-only scan the pass-through columns are additionally rewritten to the table
+	// function's outputs, since the base scan is gone.
+	var scanRemap map[[2]int32]*plan.Expr
+	if canIndexOnly {
+		scanRemap = buildIvfScanToTableFuncMap(tableFuncTag, tableFuncIncludeColumns, scanNode)
+	}
+	remap := vectorRemapForChildProject(childNode, orderExpr, orderByScore[0].Expr, scanRemap)
+	return builder.spliceVectorRewrite(vecCtx, nodeID, sortByID, remap, idxColMap), nil
+}
+
+func vectorRankMode(vecCtx *vectorSortContext) string {
+	if vecCtx == nil || vecCtx.rankOption == nil {
+		return ""
+	}
+	return vecCtx.rankOption.Mode
+}
+
+func (builder *QueryBuilder) forceAdaptiveVectorRegion(vecCtx *vectorSortContext) {
+	if vecCtx == nil {
+		return
+	}
+	option := DeepCopyRankOption(vecCtx.rankOption)
+	if option == nil {
+		option = &plan.RankOption{}
+	}
+	option.Mode = "force"
+	vecCtx.rankOption = option
+	for _, node := range []*plan.Node{vecCtx.projNode, vecCtx.sortNode, vecCtx.scanNode} {
+		if node != nil {
+			node.RankOption = DeepCopyRankOption(option)
+		}
+	}
+}
+
+func (builder *QueryBuilder) adaptiveIvfReplaySafe(root int32) bool {
+	visited := make(map[int32]struct{})
+	var safe func(int32) bool
+	safe = func(id int32) bool {
+		if id < 0 || int(id) >= len(builder.qry.Nodes) {
+			return false
+		}
+		if _, ok := visited[id]; ok {
+			return true
+		}
+		visited[id] = struct{}{}
+		node := builder.qry.Nodes[id]
+		if containsSequenceNodeExpressions(node) {
+			return false
+		}
+		exprLists := [][]*plan.Expr{
+			node.ProjectList, node.OnList, node.FilterList, node.GroupBy,
+			node.AggList, node.WinSpecList, node.TblFuncExprList,
+			node.BlockFilterList, node.FillVal, node.OnUpdateExprs,
+		}
+		for _, exprs := range exprLists {
+			for _, expr := range exprs {
+				if ContainsVolatileFunction(expr) {
+					return false
+				}
+			}
+		}
+		for _, spec := range node.OrderBy {
+			if spec != nil && ContainsVolatileFunction(spec.Expr) {
+				return false
+			}
+		}
+		for _, child := range node.Children {
+			if !safe(child) {
+				return false
+			}
+		}
+		return true
+	}
+	return safe(root)
+}
+
+func (builder *QueryBuilder) adaptiveIvfTopSupported(nodeID int32, vecCtx *vectorSortContext, allowMultiColumn bool) bool {
+	return vecCtx != nil && vecCtx.projNode != nil && len(vecCtx.projNode.ProjectList) > 0 &&
+		(allowMultiColumn || len(vecCtx.projNode.ProjectList) == 1) &&
+		!vecCtx.hasMembership && vecCtx.providerNodeID < 0 &&
+		builder.adaptiveIvfReplaySafe(nodeID)
+}
+
+func (builder *QueryBuilder) buildAdaptiveIvfTop(
+	nodeID int32,
+	vecCtx *vectorSortContext,
+	multiTableIndex *MultiTableIndex,
+	colRefCnt map[[2]int32]int,
+	idxColMap map[[2]int32]*plan.Expr,
+	autoCtx *ivfIndexContext,
+) (int32, error) {
+	return builder.buildAdaptiveIvfTopWithPolicy(
+		nodeID, vecCtx, multiTableIndex, colRefCnt, idxColMap, autoCtx, false)
+}
+
+func (builder *QueryBuilder) buildAdaptiveIvfTopWithPolicy(
+	nodeID int32,
+	vecCtx *vectorSortContext,
+	multiTableIndex *MultiTableIndex,
+	colRefCnt map[[2]int32]int,
+	idxColMap map[[2]int32]*plan.Expr,
+	autoCtx *ivfIndexContext,
+	fallbackOnEmpty bool,
+) (int32, error) {
+	ctx := builder.ctxByNode[nodeID]
+	// Replay requires an explicit positional output boundary and no external
+	// membership/provider dependency. A SORT alone has no output schema before
+	// remapping; copying its empty ProjectList cannot define candidate layouts.
+	// Keep unsupported regions intact and exact, before cloning or rewriting tags.
+	if !builder.adaptiveIvfTopSupported(nodeID, vecCtx, fallbackOnEmpty) {
+		builder.forceAdaptiveVectorRegion(vecCtx)
+		return nodeID, nil
+	}
+	var preRoot int32
+	if !fallbackOnEmpty {
+		preRoot = builder.copyNode(ctx, nodeID)
+	}
+	forceRoot := builder.copyNode(ctx, nodeID)
+
+	setVectorMode := func(root int32, mode string) {
+		visited := make(map[int32]struct{})
+		var walk func(int32)
+		walk = func(id int32) {
+			if _, ok := visited[id]; ok || id < 0 || int(id) >= len(builder.qry.Nodes) {
+				return
+			}
+			visited[id] = struct{}{}
+			node := builder.qry.Nodes[id]
+			if node.RankOption != nil || node.NodeType == plan.Node_SORT ||
+				node.NodeType == plan.Node_PROJECT || node.NodeType == plan.Node_TABLE_SCAN {
+				node.RankOption = DeepCopyRankOption(node.RankOption)
+				if node.RankOption == nil {
+					node.RankOption = &plan.RankOption{}
+				}
+				node.RankOption.Mode = mode
+			}
+			for _, child := range node.Children {
+				walk(child)
+			}
+		}
+		walk(root)
+	}
+	contextFor := func(root int32) *vectorSortContext {
+		if vecCtx.projNode != nil {
+			return builder.buildVectorSortContext(builder.qry.Nodes[root])
+		}
+		return builder.buildVectorSortContextFromSort(builder.qry.Nodes[root])
+	}
+
+	setVectorMode(nodeID, "post")
+	postCtx := contextFor(nodeID)
+	if postCtx == nil {
+		return nodeID, moerr.NewInternalErrorNoCtx("cannot rebuild adaptive POST vector context")
+	}
+	postMap := make(map[[2]int32]*plan.Expr)
+	// Keep AUTO's adaptive nprobe and other resolved search parameters. Re-running
+	// prepare after changing RankOption to explicit POST would collapse nprobe
+	// back to the session probe_limit.
+	postRoot, err := builder.applyIndicesForSortUsingIvfflatWithContext(
+		nodeID, postCtx, multiTableIndex, colRefCnt, postMap, autoCtx)
+	if err != nil {
+		return nodeID, err
+	}
+
+	setVectorMode(forceRoot, "force")
+	if !fallbackOnEmpty {
+		setVectorMode(preRoot, "pre")
+		preCtx := contextFor(preRoot)
+		if preCtx == nil {
+			return nodeID, moerr.NewInternalErrorNoCtx("cannot rebuild adaptive PRE vector context")
+		}
+		preRoot, err = builder.applyIndicesForSortUsingIvfflat(preRoot, preCtx, multiTableIndex, colRefCnt, make(map[[2]int32]*plan.Expr))
+		if err != nil {
+			return nodeID, err
+		}
+	}
+	for key, expr := range postMap {
+		idxColMap[key] = expr
+	}
+
+	resultLimit, _ := vectorResultPagination(vecCtx)
+	if resultLimit == nil {
+		return nodeID, moerr.NewInternalErrorNoCtx("adaptive vector result limit is missing")
+	}
+	postNode := builder.qry.Nodes[postRoot]
+	adaptive := &plan.Node{
+		NodeType:                   plan.Node_ADAPTIVE_TOP,
+		Children:                   []int32{postRoot, forceRoot},
+		Limit:                      DeepCopyExpr(resultLimit),
+		ProjectList:                DeepCopyExprList(postNode.ProjectList),
+		BindingTags:                append([]int32(nil), postNode.BindingTags...),
+		Stats:                      DeepCopyStats(postNode.Stats),
+		AdaptiveTopFallbackOnEmpty: fallbackOnEmpty,
+	}
+	if !fallbackOnEmpty {
+		adaptive.Children = []int32{postRoot, preRoot, forceRoot}
+	}
+	if adaptive.Stats != nil && resultLimit.GetLit() != nil {
+		limit := resultLimit.GetLit().GetU64Val()
+		if adaptive.Stats.Outcnt > float64(limit) {
+			adaptive.Stats.Outcnt = float64(limit)
+		}
+	}
+	return builder.appendNode(adaptive, ctx), nil
+}
+
+func rebindIvfPreFilters(filters []*plan.Expr, scanNode *plan.Node, includeColumns []string) []*plan.Expr {
+	out := DeepCopyExprList(filters)
+	if scanNode == nil || scanNode.TableDef == nil || len(scanNode.BindingTags) == 0 {
+		return out
+	}
+	includePos := make(map[string]int32, len(includeColumns))
+	for i, name := range includeColumns {
+		includePos[name] = int32(4 + i)
+	}
+	pkName := ""
+	if scanNode.TableDef.Pkey != nil {
+		pkName = scanNode.TableDef.Pkey.PkeyColName
+	}
+	var rebind func(*plan.Expr)
+	rebind = func(expr *plan.Expr) {
+		if expr == nil {
+			return
+		}
+		if col := expr.GetCol(); col != nil && col.RelPos == scanNode.BindingTags[0] && col.ColPos >= 0 && int(col.ColPos) < len(scanNode.TableDef.Cols) {
+			name := scanNode.TableDef.Cols[col.ColPos].Name
+			switch {
+			case name == pkName:
+				col.RelPos, col.ColPos = 0, 2
+				col.Name = catalog.SystemSI_IVFFLAT_TblCol_Entries_pk
+			case includePos[name] != 0:
+				col.RelPos, col.ColPos = 0, includePos[name]
+				col.Name = catalog.SystemSI_IVFFLAT_IncludeColPrefix + name
+			}
+		}
+		if fn := expr.GetF(); fn != nil {
+			for _, arg := range fn.Args {
+				rebind(arg)
+			}
+		}
+		if list := expr.GetList(); list != nil {
+			for _, item := range list.List {
+				rebind(item)
+			}
+		}
+	}
+	for _, filter := range out {
+		rebind(filter)
+	}
+	return out
+}
+
+func (builder *QueryBuilder) buildPkExprFromNode(nodeID int32, pkType plan.Type, pkName string) *plan.Expr {
+	if builder == nil || nodeID < 0 {
+		return nil
+	}
+	node := builder.qry.Nodes[nodeID]
+	switch node.NodeType {
+	case plan.Node_TABLE_SCAN:
+		if node.TableDef == nil || len(node.BindingTags) == 0 {
+			return nil
+		}
+		colIdx, ok := node.TableDef.Name2ColIndex[pkName]
+		if !ok {
+			if node.IndexScanInfo.IsIndexScan {
+				colIdx, ok = node.TableDef.Name2ColIndex[catalog.IndexTablePrimaryColName]
+				if !ok {
+					logutil.Debugf("IVF buildPkExprFromNode: index primary column %q missing in table %q for node %d", catalog.IndexTablePrimaryColName, node.TableDef.Name, nodeID)
+					return nil
+				}
+			} else {
+				if node.TableDef.Pkey == nil {
+					return nil
+				}
+				colIdx = node.TableDef.Name2ColIndex[node.TableDef.Pkey.PkeyColName]
+			}
+		}
+		return &plan.Expr{
+			Typ: pkType,
+			Expr: &plan.Expr_Col{
+				Col: &plan.ColRef{
+					RelPos: node.BindingTags[0],
+					ColPos: colIdx,
+					Name:   pkName,
+				},
+			},
+		}
+	case plan.Node_PROJECT:
+		for _, expr := range node.ProjectList {
+			if col := expr.GetCol(); col != nil {
+				if builder.getColName(col) == pkName {
+					return DeepCopyExpr(expr)
+				}
+			}
+		}
+		// If PROJECT doesn't expose PK, don't recurse to child: using child's binding tag here
+		// would produce stale ColRef(RelPos) for joins/runtime filters above this PROJECT.
+		return nil
+	case plan.Node_JOIN:
+		if len(node.Children) > 0 {
+			return builder.buildPkExprFromNode(node.Children[0], pkType, pkName)
+		}
+	default:
+		if len(node.Children) > 0 {
+			return builder.buildPkExprFromNode(node.Children[0], pkType, pkName)
+		}
+	}
+	return nil
+}
+
+func (builder *QueryBuilder) findScanNodeByTag(nodeID, tag int32) int32 {
+	return builder.findScanNodeByTagWithVisited(nodeID, tag, make(map[int32]struct{}))
+}
+
+func (builder *QueryBuilder) findScanNodeByTagWithVisited(nodeID, tag int32, visited map[int32]struct{}) int32 {
+	if builder == nil || nodeID < 0 {
+		return -1
+	}
+	if _, seen := visited[nodeID]; seen {
+		return -1
+	}
+	visited[nodeID] = struct{}{}
+	node := builder.qry.Nodes[nodeID]
+	if node.NodeType == plan.Node_TABLE_SCAN && len(node.BindingTags) > 0 && node.BindingTags[0] == tag {
+		return nodeID
+	}
+	for _, childID := range node.Children {
+		if found := builder.findScanNodeByTagWithVisited(childID, tag, visited); found >= 0 {
+			return found
+		}
+	}
+	return -1
+}
+
+func (builder *QueryBuilder) getColName(col *plan.ColRef) string {
+	if col == nil {
+		return ""
+	}
+	if builder == nil || builder.nameByColRef == nil {
+		return col.Name
+	}
+	if name := builder.nameByColRef[[2]int32{col.RelPos, col.ColPos}]; name != "" {
+		return name
+	}
+	return col.Name
+}
+
+func (builder *QueryBuilder) rebindScanNode(scanNode *plan.Node) {
+	if scanNode == nil || len(scanNode.BindingTags) == 0 {
+		return
+	}
+	oldTag := scanNode.BindingTags[0]
+	newTag := builder.genNewBindTag()
+	scanNode.BindingTags[0] = newTag
+	builder.addNameByColRef(newTag, scanNode.TableDef)
+	for _, expr := range scanNode.FilterList {
+		replaceColRefTag(expr, oldTag, newTag)
+	}
+	// Also update BlockFilterList, which was copied from the original scanNode
+	// and still contains references to the old binding tag
+	for _, expr := range scanNode.BlockFilterList {
+		replaceColRefTag(expr, oldTag, newTag)
+	}
+}
+
+func replaceColRefTag(expr *plan.Expr, oldTag, newTag int32) {
+	if expr == nil {
+		return
+	}
+	switch impl := expr.Expr.(type) {
+	case *plan.Expr_Col:
+		if impl.Col.RelPos == oldTag {
+			impl.Col.RelPos = newTag
+		}
+	case *plan.Expr_F:
+		for _, arg := range impl.F.Args {
+			replaceColRefTag(arg, oldTag, newTag)
+		}
+	case *plan.Expr_List:
+		for _, sub := range impl.List.List {
+			replaceColRefTag(sub, oldTag, newTag)
+		}
+	}
+}
+
+func (builder *QueryBuilder) canApplyRegularIndex(node *plan.Node) bool {
+	if node == nil || node.TableDef == nil {
+		return false
+	}
+	colCnt := len(node.TableDef.Cols)
+	if colCnt == 0 {
+		return false
+	}
+	for _, expr := range node.FilterList {
+		if !colRefsWithin(expr, colCnt) {
+			return false
+		}
+	}
+	return len(node.FilterList) > 0
+}
+
+func clearLimitOffsetInSubtree(qry *plan.Query, nodeID int32) {
+	if qry == nil || nodeID < 0 {
+		return
+	}
+	node := qry.Nodes[nodeID]
+	node.Limit = nil
+	node.Offset = nil
+	for _, childID := range node.Children {
+		clearLimitOffsetInSubtree(qry, childID)
+	}
+}
+
+func colRefsWithin(expr *plan.Expr, colCnt int) bool {
+	if expr == nil {
+		return true
+	}
+	switch impl := expr.Expr.(type) {
+	case *plan.Expr_Col:
+		return int(impl.Col.ColPos) < colCnt
+	case *plan.Expr_F:
+		for _, arg := range impl.F.Args {
+			if !colRefsWithin(arg, colCnt) {
+				return false
+			}
+		}
+		return true
+	case *plan.Expr_List:
+		for _, sub := range impl.List.List {
+			if !colRefsWithin(sub, colCnt) {
+				return false
+			}
+		}
+		return true
+	default:
+		return true
+	}
+}
+
+func extractColRefs(expr *plan.Expr, tag int32, colRefCnt map[[2]int32]int) {
+	if expr == nil {
+		return
+	}
+	switch impl := expr.Expr.(type) {
+	case *plan.Expr_Col:
+		if impl.Col.RelPos == tag {
+			colRefCnt[[2]int32{tag, impl.Col.ColPos}]++
+		}
+	case *plan.Expr_F:
+		for _, arg := range impl.F.Args {
+			extractColRefs(arg, tag, colRefCnt)
+		}
+	case *plan.Expr_Sub:
+		return
+	case *plan.Expr_List:
+		for _, sub := range impl.List.List {
+			extractColRefs(sub, tag, colRefCnt)
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// IVFFlat result-column source resolution.
+//
+// These functions resolve a INDEX_SEARCH_SCAN result column (pkid / score /
+// __mo_index_include_<name>) back to its source-table column metadata. They live
+// here, in the ivfflat plan layer, rather than in build.go's generic result-column
+// resolver, because the synthetic schema they decode is IVFFlat-specific.
+// build.go dispatches into resultColumnSourceFromIndexSearchScan for a
+// INDEX_SEARCH_SCAN node; the function fails closed (returns nil) for any node
+// whose index algorithm is not IVFFlat, so a INDEX_SEARCH_SCAN emitted by another
+// algorithm never inherits IVFFlat's schema by accident (#29212). Relocated from
+// build.go where it was introduced by PR #28833 (fixes #28719).
+// -----------------------------------------------------------------------------
+
+func resultColumnSourceFromIndexSearchScan(scan *plan.IndexSearchScan, vectorTableDef *plan.TableDef, colPos int32) *resultColumnSource {
+	if scan == nil || scan.SourceTableDef == nil || vectorTableDef == nil || colPos < 0 {
+		return nil
+	}
+
+	// Every INDEX_SEARCH_SCAN emits the synthetic schema (pkid, score,
+	// __mo_index_include_<name>); any other column name fails closed (#29212).
+	if scan.Index == nil {
+		return nil
+	}
+
+	// remapAllColRefs compacts INDEX_SEARCH_SCAN.TableDef.Cols to only the
+	// slots still referenced by consumers and rewrites their ColPos values to
+	// local positions. Resolve the synthetic column name (not the slot index),
+	// so a pruned [score, include] schema cannot be mistaken for the original
+	// [pkid, score, include...] layout.
+	if int(colPos) >= len(vectorTableDef.Cols) {
+		return nil
+	}
+	col := vectorTableDef.Cols[colPos]
+	if col == nil {
+		return nil
+	}
+	var sourceColPos int32
+	switch {
+	case strings.EqualFold(col.Name, "pkid"):
+		sourceColPos = resultColumnPrimaryKeyPosition(scan.SourceTableDef)
+		if sourceColPos < 0 {
+			return nil
+		}
+	case strings.EqualFold(col.Name, "score"):
+		return nil
+	case strings.HasPrefix(col.Name, catalog.SystemSI_IVFFLAT_IncludeColPrefix):
+		includeName := strings.TrimPrefix(col.Name, catalog.SystemSI_IVFFLAT_IncludeColPrefix)
+		if includeName == "" || !resultColumnNameInList(scan.IncludedColumns, includeName) {
+			return nil
+		}
+		var found bool
+		sourceColPos, found = resultColumnPositionByName(scan.SourceTableDef, includeName)
+		if !found {
+			return nil
+		}
+	default:
+		return nil
+	}
+
+	source := resultColumnSourceFromTableDef(scan.SourceTableDef, sourceColPos)
+	if source == nil {
+		return nil
+	}
+	// ObjectRef is the authoritative resolved object identity for vector
+	// scans.  Older plans may leave the corresponding names empty on
+	// SourceTableDef, so use it only to complete missing/physical names.
+	if scan.SourceTable != nil {
+		if source.dbName == "" {
+			source.dbName = scan.SourceTable.DbName
+			if source.dbName == "" {
+				source.dbName = scan.SourceTable.SchemaName
+			}
+		}
+		if source.tableName == "" {
+			source.tableName = scan.SourceTable.ObjName
+		}
+	}
+	return source
+}
+
+func resultColumnPrimaryKeyPosition(tableDef *plan.TableDef) int32 {
+	if tableDef == nil || tableDef.Pkey == nil || tableDef.Pkey.PkeyColName == "" {
+		return -1
+	}
+	if pos, ok := resultColumnPositionByName(tableDef, tableDef.Pkey.PkeyColName); ok {
+		return pos
+	}
+	return -1
+}
+
+func resultColumnPositionByName(tableDef *plan.TableDef, name string) (int32, bool) {
+	if tableDef == nil || name == "" {
+		return -1, false
+	}
+	if tableDef.Name2ColIndex != nil {
+		if pos, ok := tableDef.Name2ColIndex[strings.ToLower(name)]; ok &&
+			pos >= 0 && int(pos) < len(tableDef.Cols) && tableDef.Cols[pos] != nil &&
+			strings.EqualFold(tableDef.Cols[pos].GetOriginCaseName(), name) {
+			return pos, true
+		}
+	}
+
+	var found int32 = -1
+	for pos, col := range tableDef.Cols {
+		if col == nil || !strings.EqualFold(col.GetOriginCaseName(), name) {
+			continue
+		}
+		if found >= 0 {
+			return -1, false
+		}
+		found = int32(pos)
+	}
+	return found, found >= 0
+}

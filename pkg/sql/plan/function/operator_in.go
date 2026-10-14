@@ -1,0 +1,264 @@
+// Copyright 2022 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package function
+
+import (
+	"bytes"
+
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/vm/process"
+	"golang.org/x/exp/constraints"
+)
+
+type TGenericOfIn interface {
+	constraints.Integer | constraints.Float | bool | types.Uuid |
+		types.Time | types.Timestamp | types.Date | types.Datetime | types.Decimal64 | types.Decimal128 | types.Decimal256 | types.MoYear
+}
+
+type opOperatorFixedIn[T TGenericOfIn] struct {
+	ready   bool
+	hasNull bool
+	mp      map[T]bool
+}
+
+type opOperatorStrIn struct {
+	ready    bool
+	hasNull  bool
+	padSpace bool
+	typ      types.Type
+	mp       map[string]bool
+}
+
+func newOpOperatorFixedIn[T TGenericOfIn]() *opOperatorFixedIn[T] {
+	op := new(opOperatorFixedIn[T])
+	op.ready = false
+	return op
+}
+
+func newOpOperatorStrIn() *opOperatorStrIn {
+	op := new(opOperatorStrIn)
+	op.ready = false
+	return op
+}
+
+func (op *opOperatorFixedIn[T]) init(tuple *vector.Vector) {
+	op.ready = true
+	op.hasNull = false
+
+	if tuple.IsConstNull() {
+		op.hasNull = true
+		op.mp = make(map[T]bool)
+		return
+	}
+	p := vector.GenerateFunctionFixedTypeParameter[T](tuple)
+
+	if tuple.IsConst() {
+		v, null := p.GetValue(0)
+		if null {
+			op.hasNull = true
+			op.mp = make(map[T]bool)
+			return
+		}
+		op.mp = make(map[T]bool, 1)
+		op.mp[v] = true
+		return
+	}
+
+	op.mp = make(map[T]bool, tuple.Length())
+	for i := uint64(0); i < uint64(tuple.Length()); i++ {
+		v, null := p.GetValue(i)
+		if null {
+			op.hasNull = true
+			continue
+		}
+		op.mp[v] = true
+	}
+}
+
+func (op *opOperatorStrIn) init(left, tuple *vector.Vector) {
+	op.ready = true
+	op.hasNull = false
+	op.typ = *tuple.GetType()
+	// The left operand is the resolved comparison domain for an IN
+	// expression. A prepared/literal list can arrive with the transport
+	// charset, so deriving the key type from the list alone silently drops a
+	// native Unicode collation. Keep a Unicode type from either side and prefer
+	// the left operand when both sides already agree on the domain.
+	if left != nil && (types.IsUnicodeCollation(left.GetType().Charset) ||
+		!types.IsUnicodeCollation(op.typ.Charset)) {
+		op.typ = *left.GetType()
+	}
+	op.padSpace = op.typ.Oid == types.T_char || tuple.GetType().Oid == types.T_char
+
+	if tuple.IsConstNull() {
+		op.hasNull = true
+		op.mp = make(map[string]bool)
+		return
+	}
+	p := vector.GenerateFunctionStrParameter(tuple)
+
+	if tuple.IsConst() {
+		v, null := p.GetStrValue(0)
+		if null {
+			op.hasNull = true
+			op.mp = make(map[string]bool)
+			return
+		}
+		op.mp = make(map[string]bool, 1)
+		op.mp[op.key(v)] = true
+		return
+	}
+
+	op.mp = make(map[string]bool)
+	for i := uint64(0); i < uint64(tuple.Length()); i++ {
+		v, null := p.GetStrValue(i)
+		if null {
+			op.hasNull = true
+			continue
+		}
+		op.mp[op.key(v)] = true
+	}
+}
+
+func (op *opOperatorStrIn) key(value []byte) string {
+	if op.padSpace {
+		value = bytes.TrimRight(value, " ")
+	}
+	if types.IsUnicodeCollation(op.typ.Charset) {
+		// IN/NOT IN must use the same tagged comparison domain as equality and
+		// grouping. In particular, an invalid/repertoire-invalid value gets a
+		// distinct marker instead of being inserted as an untagged raw key that
+		// can collide with a valid UCA weight string.
+		value = types.CollationKeyOrOriginal(op.typ.Charset, value)
+	}
+	return string(value)
+}
+
+func (op *opOperatorFixedIn[T]) operatorIn(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
+	if !op.ready {
+		op.init(parameters[1])
+	}
+
+	p := vector.GenerateFunctionFixedTypeParameter[T](parameters[0])
+	rs := vector.MustFunctionResult[bool](result)
+	for i := uint64(0); i < uint64(length); i++ {
+		v, null := p.GetValue(i)
+		if null {
+			if err := rs.Append(false, true); err != nil {
+				return err
+			}
+		} else {
+			_, ok := op.mp[v]
+			if !ok && op.hasNull {
+				if err := rs.Append(false, true); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := rs.Append(ok, false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (op *opOperatorFixedIn[T]) operatorNotIn(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
+	if !op.ready {
+		op.init(parameters[1])
+	}
+
+	p := vector.GenerateFunctionFixedTypeParameter[T](parameters[0])
+	rs := vector.MustFunctionResult[bool](result)
+	for i := uint64(0); i < uint64(length); i++ {
+		v, null := p.GetValue(i)
+		if null {
+			if err := rs.Append(false, true); err != nil {
+				return err
+			}
+		} else {
+			_, ok := op.mp[v]
+			if !ok && op.hasNull {
+				if err := rs.Append(false, true); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := rs.Append(!ok, false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (op *opOperatorStrIn) operatorIn(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
+	if !op.ready {
+		op.init(parameters[0], parameters[1])
+	}
+
+	p := vector.GenerateFunctionStrParameter(parameters[0])
+	rs := vector.MustFunctionResult[bool](result)
+	for i := uint64(0); i < uint64(length); i++ {
+		v, null := p.GetStrValue(i)
+		if null {
+			if err := rs.Append(false, true); err != nil {
+				return err
+			}
+		} else {
+			_, ok := op.mp[op.key(v)]
+			if !ok && op.hasNull {
+				if err := rs.Append(false, true); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := rs.Append(ok, false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (op *opOperatorStrIn) operatorNotIn(parameters []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
+	if !op.ready {
+		op.init(parameters[0], parameters[1])
+	}
+
+	p := vector.GenerateFunctionStrParameter(parameters[0])
+	rs := vector.MustFunctionResult[bool](result)
+	for i := uint64(0); i < uint64(length); i++ {
+		v, null := p.GetStrValue(i)
+		if null {
+			if err := rs.Append(false, true); err != nil {
+				return err
+			}
+		} else {
+			_, ok := op.mp[op.key(v)]
+			if !ok && op.hasNull {
+				if err := rs.Append(false, true); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := rs.Append(!ok, false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}

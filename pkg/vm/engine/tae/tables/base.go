@@ -1,0 +1,658 @@
+// Copyright 2021 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package tables
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"sync/atomic"
+
+	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
+	"go.uber.org/zap"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/dbutils"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables/updates"
+)
+
+type BlockT[T common.IRef] interface {
+	common.IRef
+	Pin() *common.PinnedItem[T]
+	GetID() *common.ID
+}
+
+type baseObject struct {
+	common.RefHelper
+	*sync.RWMutex
+	rt         *dbutils.Runtime
+	meta       atomic.Pointer[catalog.ObjectEntry]
+	appendMVCC *updates.AppendMVCCHandle
+	impl       data.Object
+
+	node atomic.Pointer[Node]
+}
+
+func newBaseObject(
+	impl data.Object,
+	meta *catalog.ObjectEntry,
+	rt *dbutils.Runtime,
+) *baseObject {
+	obj := &baseObject{
+		impl:       impl,
+		rt:         rt,
+		appendMVCC: updates.NewAppendMVCCHandle(meta),
+	}
+	obj.meta.Store(meta)
+	obj.appendMVCC.SetAppendListener(
+		obj.OnApplyAppend)
+	obj.RWMutex = obj.appendMVCC.RWMutex
+	return obj
+}
+
+func (obj *baseObject) GetMutex() *sync.RWMutex { return obj.RWMutex }
+func (obj *baseObject) UpdateMeta(meta any) {
+	obj.meta.Store(meta.(*catalog.ObjectEntry))
+}
+
+func (obj *baseObject) OnApplyAppend(n txnif.AppendNode) (err error) {
+	if n.IsTombstone() {
+		obj.meta.Load().GetTable().RemoveRows(
+			uint64(n.GetMaxRow() - n.GetStartRow()),
+		)
+		return
+	}
+	obj.meta.Load().GetTable().AddRows(
+		uint64(n.GetMaxRow() - n.GetStartRow()),
+	)
+	return
+}
+func (obj *baseObject) Close() {
+	// TODO
+}
+
+func (obj *baseObject) GetRuntime() *dbutils.Runtime {
+	return obj.rt
+}
+
+func (obj *baseObject) PinNode() *Node {
+	n := obj.node.Load()
+	// if ref fails, reload.
+	// Note: avoid bad case where releasing happens before Ref()
+	for ; !n.RefIfHasRef(); n = obj.node.Load() {
+	}
+	return n
+}
+
+func (obj *baseObject) Rows() (int, error) {
+	node := obj.PinNode()
+	defer node.Unref()
+	if !node.IsPersisted() {
+		obj.RLock()
+		defer obj.RUnlock()
+		rows, err := node.Rows()
+		return int(rows), err
+	} else {
+		rows, err := node.Rows()
+		return int(rows), err
+	}
+}
+
+func (obj *baseObject) TryUpgrade() (err error) {
+	node := obj.node.Load()
+	if node.IsPersisted() {
+		return
+	}
+	pnode := newPersistedNode(obj)
+	nnode := NewNode(pnode)
+	nnode.Ref()
+
+	if !obj.node.CompareAndSwap(node, nnode) {
+		nnode.Unref()
+	} else {
+		node.Unref()
+	}
+	return
+}
+
+func (obj *baseObject) GetMeta() any { return obj.meta.Load() }
+func (obj *baseObject) CheckFlushTaskRetry(startts types.TS) bool {
+	if obj.meta.Load().HasDropCommitted() {
+		return false
+	}
+	obj.RLock()
+	defer obj.RUnlock()
+	x := obj.appendMVCC.GetLatestAppendPrepareTSLocked()
+	return x.GT(&startts)
+}
+func (obj *baseObject) GetFs() fileservice.FileService { return obj.rt.Fs }
+func (obj *baseObject) GetID() *common.ID              { return obj.meta.Load().AsCommonID() }
+
+func (obj *baseObject) buildMetalocation(bid uint16) (objectio.Location, error) {
+	if !obj.meta.Load().ObjectPersisted() {
+		panic("logic error")
+	}
+	blkMaxRows := obj.meta.Load().GetSchema().Extra.BlockMaxRows
+	return obj.meta.Load().BlockLocation(bid, blkMaxRows), nil
+}
+
+func (obj *baseObject) LoadPersistedCommitTS(bid uint16) (vec containers.Vector, err error) {
+	return obj.loadPersistedCommitTS(context.Background(), bid)
+}
+
+func (obj *baseObject) LoadPersistedMVCC(
+	bid uint16,
+) (commitTS, abort containers.Vector, err error) {
+	return obj.loadPersistedMVCC(context.Background(), bid)
+}
+
+func (obj *baseObject) loadPersistedCommitTS(
+	ctx context.Context,
+	bid uint16,
+) (vec containers.Vector, err error) {
+	vec, abort, err := obj.loadPersistedMVCC(ctx, bid)
+	if abort != nil {
+		abort.Close()
+	}
+	return vec, err
+}
+
+func (obj *baseObject) loadPersistedMVCC(
+	ctx context.Context,
+	bid uint16,
+) (commitTS, abort containers.Vector, err error) {
+	location, err := obj.buildMetalocation(bid)
+	if err != nil {
+		return
+	}
+	if location.IsEmpty() {
+		return
+	}
+	// needCopy=true is the ownership boundary here: LoadColumns2 clones the
+	// column into the transient pool and releases the source IOVector (including
+	// its CachedData) before returning. The release callback is therefore nil;
+	// the caller owns and must close the returned vector.
+	vectors, _, err := ioutil.LoadColumns2(
+		ctx,
+		[]uint16{objectio.SEQNUM_COMMITTS, objectio.SEQNUM_ABORT},
+		[]types.Type{types.T_TS.ToType(), types.T_bool.ToType()},
+		obj.rt.Fs,
+		location,
+		fileservice.Policy(0),
+		true,
+		obj.rt.VectorPool.Transient,
+	)
+	if err != nil {
+		return
+	}
+	if len(vectors) != 2 ||
+		vectors[0] == nil || vectors[0].GetType().Oid != types.T_TS ||
+		vectors[1] == nil || vectors[1].GetType().Oid != types.T_bool ||
+		vectors[0].Length() != vectors[1].Length() {
+		for _, vec := range vectors {
+			if vec != nil {
+				vec.Close()
+			}
+		}
+		err = moerr.NewInternalErrorNoCtxf(
+			"invalid persisted MVCC columns for object %s",
+			obj.meta.Load().ID().String(),
+		)
+		return
+	}
+	return vectors[0], vectors[1], nil
+}
+
+func validatePersistedCommitTSVectors(
+	objectID string,
+	vectors []containers.Vector,
+) (containers.Vector, error) {
+	if len(vectors) == 1 &&
+		vectors[0] != nil &&
+		vectors[0].GetType().Oid == types.T_TS {
+		return vectors[0], nil
+	}
+	for _, vector := range vectors {
+		if vector != nil {
+			vector.Close()
+		}
+	}
+	return nil, moerr.NewInternalErrorNoCtxf(
+		"%s: bad commits layout",
+		objectID,
+	)
+}
+
+// func (obj *baseObject) LoadPersistedColumnData(
+// 	ctx context.Context, schema *catalog.Schema, colIdx int, mp *mpool.MPool, blkID uint16,
+// ) (vec containers.Vector, err error) {
+// 	def := schema.ColDefs[colIdx]
+// 	location, err := obj.buildMetalocation(blkID)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	id := obj.meta.Load().AsCommonID()
+// 	id.SetBlockOffset(blkID)
+// 	return LoadPersistedColumnData(
+// 		ctx,
+// 		obj.rt,
+// 		id,
+// 		def,
+// 		location,
+// 		mp,
+// 	)
+// }
+
+func (obj *baseObject) Prefetch(blkID uint16) error {
+	node := obj.PinNode()
+	defer node.Unref()
+	if !node.IsPersisted() {
+		return nil
+	} else {
+		key, err := obj.buildMetalocation(blkID)
+		if err != nil {
+			return err
+		}
+		return ioutil.Prefetch(obj.rt.SID(), obj.rt.Fs, key)
+	}
+}
+
+func (obj *baseObject) ResolvePersistedColumnData(
+	ctx context.Context,
+	txn txnif.TxnReader,
+	readSchema *catalog.Schema,
+	blkOffset uint16,
+	col int,
+	mp *mpool.MPool,
+) (bat *containers.Batch, err error) {
+	err = obj.Scan(
+		ctx, &bat, txn, readSchema, blkOffset, []int{col}, mp)
+	return
+}
+
+func (obj *baseObject) getDuplicateRowsWithLoad(
+	ctx context.Context,
+	txn txnif.TxnReader,
+	keys containers.Vector,
+	sels *nulls.Bitmap,
+	rowIDs containers.Vector,
+	blkOffset uint16,
+	filterByCommitTS bool,
+	from, to types.TS,
+	mp *mpool.MPool,
+) (err error) {
+	schema := obj.meta.Load().GetSchema()
+	def := schema.GetSingleSortKey()
+	data, err := obj.ResolvePersistedColumnData(
+		ctx,
+		txn,
+		schema,
+		blkOffset,
+		def.Idx,
+		mp,
+	)
+	if err != nil {
+		return
+	}
+	defer data.Close()
+	blkID := objectio.NewBlockidWithObjectID(obj.meta.Load().ID(), blkOffset)
+	var dedupFn any
+	if filterByCommitTS {
+		loader := &commitTSLoader{
+			load: func() (containers.Vector, containers.Vector, error) {
+				return obj.loadPersistedMVCC(ctx, blkOffset)
+			},
+		}
+		defer loader.close()
+		dedupFn = containers.MakeForeachVectorOp(
+			keys.GetType().Oid,
+			getRowIDAlkFunctions,
+			data.Vecs[0], //
+			rowIDs,
+			blkID,
+			loader,
+			txn,
+			from, to,
+		)
+	} else {
+		dedupFn = containers.MakeForeachVectorOp(
+			keys.GetType().Oid,
+			getDuplicatedRowIDNABlkFunctions,
+			data.Vecs[0],
+			rowIDs,
+			blkID,
+		)
+	}
+	err = containers.ForeachVector(keys, dedupFn, sels)
+	if err != nil {
+		logutil.Info("Dedup-Err",
+			zap.Any("err", err),
+			zap.String("txn", txn.Repr()),
+			zap.String("obj", obj.meta.Load().ID().String()),
+			zap.Uint16("blk offset", blkOffset))
+	}
+	return
+}
+
+func (obj *baseObject) containsWithLoad(
+	ctx context.Context,
+	txn txnif.TxnReader,
+	keys containers.Vector,
+	sels *nulls.Bitmap,
+	blkOffset uint16,
+	isAblk bool,
+	mp *mpool.MPool,
+) (err error) {
+	schema := obj.meta.Load().GetSchema()
+	def := schema.GetSingleSortKey()
+	data, err := obj.ResolvePersistedColumnData(
+		ctx,
+		txn,
+		schema,
+		blkOffset,
+		def.Idx,
+		mp,
+	)
+	if err != nil {
+		return
+	}
+	defer data.Close()
+	var dedupFn any
+	if isAblk {
+		dedupFn = containers.MakeForeachVectorOp(
+			keys.GetType().Oid, containsAlkFunctions, data.Vecs[0], keys, obj.LoadPersistedMVCC, txn,
+			func(vrowID any, commitTS types.TS) (types.TS, error) {
+				rowID := vrowID.(types.Rowid)
+				blkID := rowID.BorrowBlockID()
+				dels := obj.rt.TransferDelsMap.GetDelsForBlk(*blkID)
+				if dels == nil {
+					logutil.Info("Dedup-WW",
+						zap.String("txn", txn.Repr()),
+						zap.String("data row id", rowID.String()),
+						zap.String("commit ts %v", commitTS.ToString()),
+					)
+					return types.TS{}, txnif.ErrTxnWWConflict
+				}
+				row := rowID.GetRowOffset()
+				ts, ok := dels.Mapping[int(row)]
+				if !ok {
+					logutil.Info("Dedup-WW",
+						zap.String("txn", txn.Repr()),
+						zap.String("data row id", rowID.String()),
+						zap.String("commit ts", commitTS.ToString()),
+					)
+					return types.TS{}, txnif.ErrTxnWWConflict
+				}
+				logutil.Info("Dedup",
+					zap.String("txn", txn.Repr()),
+					zap.String("data row id", rowID.String()),
+					zap.String("commit ts", commitTS.ToString()),
+				)
+				return ts, nil
+			},
+		)
+	} else {
+		dedupFn = containers.MakeForeachVectorOp(
+			keys.GetType().Oid,
+			containsNABlkFunctions,
+			data.Vecs[0],
+			keys,
+		)
+	}
+	err = containers.ForeachVector(keys, dedupFn, sels)
+	if err != nil {
+		logutil.Info("Dedup-Err",
+			zap.Any("err", err),
+			zap.String("txn", txn.Repr()),
+			zap.String("obj", obj.meta.Load().ID().String()),
+			zap.Uint16("blk offset", blkOffset))
+	}
+	return
+}
+
+func (obj *baseObject) persistedGetDuplicatedRows(
+	ctx context.Context,
+	txn txnif.TxnReader,
+	from, to types.TS,
+	keys containers.Vector,
+	keysZM index.ZM,
+	rowIDs containers.Vector,
+	filterByCommitTS bool,
+	mp *mpool.MPool,
+) (err error) {
+	pkIndex, err := MakeImmuIndex(
+		ctx,
+		obj.meta.Load(),
+		nil,
+		obj.rt,
+	)
+	if err != nil {
+		return
+	}
+	for i := 0; i < obj.meta.Load().BlockCnt(); i++ {
+		sels, err := pkIndex.BatchDedup(
+			ctx,
+			keys,
+			keysZM,
+			obj.rt,
+			obj.meta.Load().IsTombstone,
+			uint32(i),
+		)
+		if err == nil || !moerr.IsMoErrCode(err, moerr.OkExpectedPossibleDup) {
+			continue
+		}
+		err = obj.getDuplicateRowsWithLoad(
+			ctx, txn, keys, sels, rowIDs, uint16(i), filterByCommitTS, from, to, mp)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (obj *baseObject) persistedContains(
+	ctx context.Context,
+	txn txnif.TxnReader,
+	keys containers.Vector,
+	keysZM index.ZM,
+	isAblk bool,
+	mp *mpool.MPool,
+) (err error) {
+	pkIndex, err := MakeImmuIndex(
+		ctx,
+		obj.meta.Load(),
+		nil,
+		obj.rt,
+	)
+	if err != nil {
+		return
+	}
+	for i := 0; i < obj.meta.Load().BlockCnt(); i++ {
+		sels, err := pkIndex.BatchDedup(
+			ctx,
+			keys,
+			keysZM,
+			obj.rt,
+			true,
+			uint32(i),
+		)
+		if err == nil || !moerr.IsMoErrCode(err, moerr.OkExpectedPossibleDup) {
+			continue
+		}
+		err = obj.containsWithLoad(
+			ctx, txn, keys, sels, uint16(i), isAblk, mp)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (obj *baseObject) OnReplayAppend(_ txnif.AppendNode) (err error) {
+	panic("not supported")
+}
+
+func (obj *baseObject) OnReplayAppendPayload(_ *containers.Batch) (err error) {
+	panic("not supported")
+}
+
+func (obj *baseObject) MakeAppender() (appender data.ObjectAppender, err error) {
+	panic("not supported")
+}
+
+func (obj *baseObject) IsAppendable() bool { return false }
+
+func (obj *baseObject) PPString(level common.PPLevel, depth int, prefix string, blkid int) string {
+	rows, err := obj.Rows()
+	if err != nil {
+		logutil.Warnf("get object rows failed, obj: %v, err: %v", obj.meta.Load().ID().String(), err)
+	}
+	s := fmt.Sprintf("%s | [Rows=%d]", obj.meta.Load().PPString(level, depth, prefix), rows)
+	if level >= common.PPL1 {
+		obj.RLock()
+		var appendstr, deletestr string
+		if obj.appendMVCC != nil {
+			appendstr = obj.appendMVCC.StringLocked()
+		}
+		obj.RUnlock()
+		if appendstr != "" {
+			s = fmt.Sprintf("%s\n Appends: %s", s, appendstr)
+		}
+		if deletestr != "" {
+			s = fmt.Sprintf("%s\n Deletes: %s", s, deletestr)
+		}
+	}
+	return s
+}
+func (obj *baseObject) Scan(
+	ctx context.Context,
+	bat **containers.Batch,
+	txn txnif.TxnReader,
+	readSchema any,
+	blkID uint16,
+	colIdxes []int,
+	mp *mpool.MPool,
+) (err error) {
+	node := obj.PinNode()
+	defer node.Unref()
+	return node.Scan(
+		ctx, bat, txn, readSchema.(*catalog.Schema), blkID, colIdxes, mp)
+}
+
+func (obj *baseObject) FillBlockTombstones(
+	ctx context.Context,
+	txn txnif.TxnReader,
+	blkID *objectio.Blockid,
+	deletes **nulls.Nulls,
+	deleteStartOffset uint64,
+	mp *mpool.MPool) error {
+	node := obj.PinNode()
+	defer node.Unref()
+	if !obj.meta.Load().IsTombstone {
+		panic("logic err")
+	}
+	return node.FillBlockTombstones(ctx, txn, blkID, deletes, deleteStartOffset, mp)
+}
+
+func (obj *baseObject) ScanInMemory(
+	ctx context.Context,
+	batches map[uint32]*containers.BatchWithVersion,
+	start, end types.TS,
+	mp *mpool.MPool,
+) (err error) {
+	node := obj.PinNode()
+	defer node.Unref()
+	if node.IsPersisted() {
+		return nil
+	}
+	mnode := node.MustMNode()
+	return mnode.getDataWindowOnWriteSchema(ctx, batches, start, end, mp)
+}
+
+func (obj *baseObject) CollectObjectTombstoneInRange(
+	ctx context.Context,
+	start, end types.TS,
+	objID *types.Objectid,
+	bat **containers.Batch,
+	mp *mpool.MPool,
+	vpool *containers.VectorPool,
+) (err error) {
+	if !obj.meta.Load().IsTombstone {
+		panic("logic err")
+	}
+	node := obj.PinNode()
+	defer node.Unref()
+	return node.CollectObjectTombstoneInRange(ctx, start, end, objID, bat, mp, vpool)
+}
+
+// TODO: equal filter
+func (obj *baseObject) GetValue(
+	ctx context.Context,
+	txn txnif.AsyncTxn,
+	readSchema any,
+	blkOffset uint16,
+	row, col int,
+	skipCheckDelete bool,
+	mp *mpool.MPool,
+) (v any, isNull bool, err error) {
+	if !obj.meta.Load().IsTombstone && !skipCheckDelete {
+		var bat *containers.Batch
+		blkID := objectio.NewBlockidWithObjectID(obj.meta.Load().ID(), blkOffset)
+		err = HybridScanByBlock(
+			ctx, obj.meta.Load().GetTable(), txn, &bat, readSchema.(*catalog.Schema), []int{col}, &blkID, mp)
+		if err != nil {
+			return
+		}
+		defer bat.Close()
+		err = txn.GetStore().FillInWorkspaceDeletes(
+			obj.meta.Load().AsCommonID(), &bat.Deletes, uint64(0))
+		if err != nil {
+			return
+		}
+		if bat.Deletes != nil && bat.Deletes.Contains(uint64(row)) {
+			err = moerr.NewNotFoundNoCtx()
+			return
+		}
+		isNull = bat.Vecs[0].IsNull(row)
+		if !isNull {
+			v = bat.Vecs[0].Get(row)
+		}
+		return
+	}
+	var bat *containers.Batch
+	err = obj.Scan(
+		ctx, &bat, txn, readSchema, blkOffset, []int{col}, mp)
+	if err != nil {
+		return
+	}
+	isNull = bat.Vecs[0].IsNull(row)
+	if !isNull {
+		v = bat.Vecs[0].Get(row)
+	}
+	bat.Close()
+	return
+}

@@ -1,0 +1,341 @@
+// Copyright 2021 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package partition
+
+import (
+	"bytes"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/container/bytejson"
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+)
+
+func genericPartition[T types.FixedSizeT](sels []int64, diffs []bool, partitions []int64, vec *vector.Vector) []int64 {
+	partitions = partitions[:0]
+	if len(sels) == 0 {
+		return partitions
+	}
+	diffs[0] = true
+	diffs = diffs[:len(sels)]
+
+	// Note: diffs is accumulated across multiple Partition calls (one per
+	// sort key in pkg/sql/colexec/order/order.go and per partition spec in
+	// pkg/sql/colexec/window/window.go). We must only OR new boundaries in
+	// and never overwrite existing ones with false.
+	if !vec.IsConst() {
+		var n bool
+		var v T
+
+		vs := vector.MustFixedColWithTypeCheck[T](vec)
+		nsp := vec.GetNulls()
+		if nsp.Any() {
+			for i, sel := range sels {
+				w := vs[sel]
+				isNull := nulls.Contains(nsp, uint64(sel))
+				if n != isNull {
+					diffs[i] = true
+				} else if !isNull {
+					diffs[i] = diffs[i] || (v != w)
+				}
+				// else: both NULL → equal, preserve diffs[i]
+				n = isNull
+				v = w
+			}
+		} else {
+			for i, sel := range sels {
+				w := vs[sel]
+				diffs[i] = diffs[i] || (v != w)
+				v = w
+			}
+		}
+	}
+	// vec.IsConst(): all rows equal under this key, no new boundaries.
+
+	for i, j := int64(0), int64(len(diffs)); i < j; i++ {
+		if diffs[i] {
+			partitions = append(partitions, i)
+		}
+	}
+
+	return partitions
+}
+
+func floatOrderPartition[T types.FixedSizeT](
+	sels []int64,
+	diffs []bool,
+	partitions []int64,
+	vec *vector.Vector,
+	compare func(T, T) int,
+) []int64 {
+	partitions = partitions[:0]
+	if len(sels) == 0 {
+		return partitions
+	}
+	diffs[0] = true
+	diffs = diffs[:len(sels)]
+
+	if !vec.IsConst() {
+		var n bool
+		var v T
+		vs := vector.MustFixedColWithTypeCheck[T](vec)
+		nsp := vec.GetNulls()
+		if nsp.Any() {
+			for i, sel := range sels {
+				w := vs[sel]
+				isNull := nulls.Contains(nsp, uint64(sel))
+				if n != isNull {
+					diffs[i] = true
+				} else if !isNull {
+					diffs[i] = diffs[i] || compare(v, w) != 0
+				}
+				n = isNull
+				v = w
+			}
+		} else {
+			for i, sel := range sels {
+				w := vs[sel]
+				diffs[i] = diffs[i] || compare(v, w) != 0
+				v = w
+			}
+		}
+	}
+
+	for i, j := int64(0), int64(len(diffs)); i < j; i++ {
+		if diffs[i] {
+			partitions = append(partitions, i)
+		}
+	}
+	return partitions
+}
+
+func bytesPartition(sels []int64, diffs []bool, partitions []int64, vec *vector.Vector) []int64 {
+	partitions = partitions[:0]
+	if len(sels) == 0 {
+		return partitions
+	}
+	diffs[0] = true
+	diffs = diffs[:len(sels)]
+
+	// See genericPartition: diffs is accumulated; never overwrite to false.
+	if !vec.IsConst() {
+		var n bool
+		var v []byte
+		typ := *vec.GetType()
+		unicode := types.IsUnicodeCollation(typ.Charset)
+
+		vs, area := vector.MustVarlenaRawData(vec)
+		nsp := vec.GetNulls()
+		if nsp.Any() {
+			for i, sel := range sels {
+				w := vs[sel].GetByteSlice(area)
+				isNull := nulls.Contains(nsp, uint64(sel))
+				if n != isNull {
+					diffs[i] = true
+				} else if !isNull {
+					if unicode {
+						diffs[i] = diffs[i] || types.CompareStringValues(typ, v, w) != 0
+					} else {
+						diffs[i] = diffs[i] || !(bytes.Equal(v, w))
+					}
+				}
+				// else: both NULL → equal, preserve diffs[i]
+				n = isNull
+				v = w
+			}
+		} else {
+			for i, sel := range sels {
+				w := vs[sel].GetByteSlice(area)
+				if unicode {
+					diffs[i] = diffs[i] || types.CompareStringValues(typ, v, w) != 0
+				} else {
+					diffs[i] = diffs[i] || !(bytes.Equal(v, w))
+				}
+				v = w
+			}
+		}
+	}
+
+	for i, j := int64(0), int64(len(diffs)); i < j; i++ {
+		if diffs[i] {
+			partitions = append(partitions, i)
+		}
+	}
+
+	return partitions
+}
+
+// Partitions will return the rowSels; vs[rowSel] != vs[last_rowSel].
+// by default, the 0th row is always not equal to the one before it
+// (though it doesn't exist)
+func Partition(sels []int64, diffs []bool, partitions []int64, vec *vector.Vector) []int64 {
+	// A constant NULL has no payload domain (a literal NULL can be ANY).
+	// It contributes no new boundaries, but must retain earlier sort keys.
+	if vec.IsConstNull() {
+		partitions = partitions[:0]
+		if len(sels) == 0 {
+			return partitions
+		}
+		diffs[0] = true
+		for i, different := range diffs[:len(sels)] {
+			if different {
+				partitions = append(partitions, int64(i))
+			}
+		}
+		return partitions
+	}
+	switch vec.GetType().Oid {
+	case types.T_bool:
+		return genericPartition[bool](sels, diffs, partitions, vec)
+	case types.T_bit:
+		return genericPartition[uint64](sels, diffs, partitions, vec)
+	case types.T_int8:
+		return genericPartition[int8](sels, diffs, partitions, vec)
+	case types.T_int16:
+		return genericPartition[int16](sels, diffs, partitions, vec)
+	case types.T_int32:
+		return genericPartition[int32](sels, diffs, partitions, vec)
+	case types.T_int64:
+		return genericPartition[int64](sels, diffs, partitions, vec)
+	case types.T_uint8:
+		return genericPartition[uint8](sels, diffs, partitions, vec)
+	case types.T_uint16:
+		return genericPartition[uint16](sels, diffs, partitions, vec)
+	case types.T_uint32:
+		return genericPartition[uint32](sels, diffs, partitions, vec)
+	case types.T_uint64:
+		return genericPartition[uint64](sels, diffs, partitions, vec)
+	case types.T_float32:
+		return genericPartition[float32](sels, diffs, partitions, vec)
+	case types.T_float64:
+		return genericPartition[float64](sels, diffs, partitions, vec)
+	case types.T_uuid:
+		return genericPartition[types.Uuid](sels, diffs, partitions, vec)
+	case types.T_date:
+		return genericPartition[types.Date](sels, diffs, partitions, vec)
+	case types.T_datetime:
+		return genericPartition[types.Datetime](sels, diffs, partitions, vec)
+	case types.T_time:
+		return genericPartition[types.Time](sels, diffs, partitions, vec)
+	case types.T_timestamp:
+		return genericPartition[types.Timestamp](sels, diffs, partitions, vec)
+	case types.T_enum:
+		return genericPartition[types.Enum](sels, diffs, partitions, vec)
+	case types.T_year:
+		return genericPartition[types.MoYear](sels, diffs, partitions, vec)
+	case types.T_decimal64:
+		return genericPartition[types.Decimal64](sels, diffs, partitions, vec)
+	case types.T_decimal128:
+		return genericPartition[types.Decimal128](sels, diffs, partitions, vec)
+	case types.T_decimal256:
+		return genericPartition[types.Decimal256](sels, diffs, partitions, vec)
+	case types.T_TS:
+		return genericPartition[types.TS](sels, diffs, partitions, vec)
+	case types.T_Rowid:
+		return genericPartition[types.Rowid](sels, diffs, partitions, vec)
+	case types.T_Blockid:
+		return genericPartition[types.Blockid](sels, diffs, partitions, vec)
+	case types.T_char, types.T_varchar, types.T_json, types.T_text,
+		types.T_binary, types.T_varbinary, types.T_blob,
+		types.T_array_float32, types.T_array_float64,
+		types.T_array_bf16, types.T_array_float16, types.T_array_int8, types.T_array_uint8,
+		types.T_datalink:
+		return bytesPartition(sels, diffs, partitions, vec)
+		//Used by ORDER_BY SQL clause.
+		//Byte partition logic doesn't use byte.Compare or Str.
+		//Hence, we can use bytesPartition here.
+	default:
+		if vec.IsConst() {
+			// Even untyped NULL contributes no boundaries. This path never
+			// reads values, so the helper's type parameter is immaterial.
+			return genericPartition[bool](sels, diffs, partitions, vec)
+		}
+		panic(moerr.NewNotSupportedNoCtx(vec.GetType().Oid.String()))
+	}
+}
+
+// PartitionForOrder returns peer-group boundaries for SQL ORDER BY. Generic
+// Partition intentionally retains value-identity semantics for GROUP BY,
+// PARTITION BY, and storage callers; only scalar NaN equality differs here.
+func PartitionForOrder(sels []int64, diffs []bool, partitions []int64, vec *vector.Vector) []int64 {
+	switch vec.GetType().Oid {
+	case types.T_float32:
+		return floatOrderPartition(sels, diffs, partitions, vec, types.Float32OrderAscCompare)
+	case types.T_float64:
+		return floatOrderPartition(sels, diffs, partitions, vec, types.Float64OrderAscCompare)
+	case types.T_json:
+		return jsonOrderPartition(sels, diffs, partitions, vec)
+	default:
+		return Partition(sels, diffs, partitions, vec)
+	}
+}
+
+func jsonOrderPartition(
+	sels []int64, diffs []bool, partitions []int64, vec *vector.Vector,
+) []int64 {
+	partitions = partitions[:0]
+	if len(sels) == 0 {
+		return partitions
+	}
+	diffs[0] = true
+	diffs = diffs[:len(sels)]
+
+	if !vec.IsConst() {
+		data, area := vector.MustVarlenaRawData(vec)
+		nsp := vec.GetNulls()
+		var previous bytejson.ByteJson
+		var previousValid bool
+		var previousNull bool
+		var havePrevious bool
+		for i, sel := range sels {
+			isNull := nulls.Contains(nsp, uint64(sel))
+			var current bytejson.ByteJson
+			var currentValid bool
+			if !isNull {
+				current = types.DecodeJson(data[sel].GetByteSlice(area))
+				currentValid = bytejson.IsValidByteJson(current)
+			}
+
+			if havePrevious {
+				if previousNull != isNull {
+					diffs[i] = true
+				} else if !isNull {
+					var cmp int
+					if currentValid && previousValid {
+						cmp = bytejson.CompareByteJsonTrusted(current, previous)
+					} else {
+						cmp = bytejson.CompareByteJson(current, previous)
+					}
+					diffs[i] = diffs[i] || cmp != 0
+				}
+			}
+
+			if !isNull {
+				previous = current
+				previousValid = currentValid
+			}
+			previousNull = isNull
+			havePrevious = true
+		}
+	}
+
+	for i, j := int64(0), int64(len(diffs)); i < j; i++ {
+		if diffs[i] {
+			partitions = append(partitions, i)
+		}
+	}
+	return partitions
+}

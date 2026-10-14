@@ -1,0 +1,325 @@
+// Copyright 2022 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package fileservice
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+)
+
+func Get[T any](fs FileService, name string) (res T, err error) {
+	lowerName := strings.ToLower(name)
+	if fs, ok := fs.(*FileServices); ok {
+		f, ok := fs.mappings[lowerName]
+		if !ok {
+			err = moerr.NewNoServiceNoCtx(name)
+			return
+		}
+		res, ok = f.(T)
+		if !ok {
+			err = moerr.NewNoServiceNoCtx(name)
+			return
+		}
+		return
+	}
+	var ok bool
+	res, ok = fs.(T)
+	if !ok {
+		err = moerr.NewNoServiceNoCtx(name)
+		return
+	}
+	if !strings.EqualFold(fs.Name(), lowerName) {
+		err = moerr.NewNoServiceNoCtx(name)
+		return
+	}
+	return
+}
+
+var NoDefaultCredentialsForETL = os.Getenv("MO_NO_DEFAULT_CREDENTIALS") != ""
+
+func etlParallelMode(ctx context.Context) ParallelMode {
+	if mode, ok := parallelModeFromContext(ctx); ok {
+		return mode
+	}
+	if mode, ok := parseParallelMode(strings.TrimSpace(os.Getenv("MO_ETL_PARALLEL_MODE"))); ok {
+		return mode
+	}
+	return ParallelOff
+}
+
+// GetForETL get or creates a FileService instance for ETL operations
+// if service part of path is empty, a LocalETLFS will be created
+// if service part of path is not empty, a ETLFileService typed instance will be extracted from fs argument
+// if service part of path is argumented, a FileService instance will be created dynamically with those arguments
+// supported dynamic file service:
+// s3,<endpoint>,<region>,<bucket>,<key>,<secret>,<prefix>
+// s3-no-key,<endpoint>,<region>,<bucket>,<prefix>
+// minio,<endpoint>,<region>,<bucket>,<key>,<secret>,<prefix>
+// s3-opts,endpoint=<endpoint>,region=<region>,bucket=<bucket>,key=<key>,secret=<secret>,prefix=<prefix>,role-arn=<role arn>,external-id=<external id>
+//
+//	key value pairs can be in any order
+func GetForETL(ctx context.Context, fs FileService, path string) (res ETLFileService, readPath string, err error) {
+	fsPath, err := ParsePath(path)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if fsPath.Service == "" {
+		// no service, create local ETL fs
+		dir, file := filepath.Split(path)
+		res, err = NewLocalETLFS("etl", dir)
+		if err != nil {
+			return nil, "", err
+		}
+		readPath = file
+
+	} else if len(fsPath.ServiceArguments) > 0 {
+		// service with arguments, create dynamically
+		switch fsPath.Service {
+
+		case "s3":
+			arguments := fsPath.ServiceArguments
+			if len(arguments) < 6 {
+				return nil, "", moerr.NewInvalidInputNoCtx("invalid S3 arguments")
+			}
+			endpoint := arguments[0]
+			region := arguments[1]
+			bucket := arguments[2]
+			accessKey := arguments[3]
+			accessSecret := arguments[4]
+			keyPrefix := arguments[5]
+			var name string
+			if len(arguments) > 6 {
+				name = arguments[6]
+			}
+
+			res, err = NewS3FS(
+				ctx,
+				ObjectStorageArguments{
+					NoBucketValidation: true,
+					Endpoint:           endpoint,
+					Region:             region,
+					Bucket:             bucket,
+					KeyID:              accessKey,
+					KeySecret:          accessSecret,
+					KeyPrefix:          keyPrefix,
+					Name:               name,
+					ParallelMode:       etlParallelMode(ctx),
+				},
+				DisabledCacheConfig,
+				nil,
+				true,
+				NoDefaultCredentialsForETL,
+			)
+			if err != nil {
+				return
+			}
+
+		case "s3-no-key":
+			arguments := fsPath.ServiceArguments
+			if len(arguments) < 4 {
+				return nil, "", moerr.NewInvalidInputNoCtx("invalid S3 arguments")
+			}
+			endpoint := arguments[0]
+			region := arguments[1]
+			bucket := arguments[2]
+			keyPrefix := arguments[3]
+			var name string
+			if len(arguments) > 4 {
+				name = arguments[4]
+			}
+
+			res, err = NewS3FS(
+				ctx,
+				ObjectStorageArguments{
+					NoBucketValidation: true,
+					Endpoint:           endpoint,
+					Region:             region,
+					Bucket:             bucket,
+					KeyPrefix:          keyPrefix,
+					Name:               name,
+					ParallelMode:       etlParallelMode(ctx),
+				},
+				DisabledCacheConfig,
+				nil,
+				true,
+				NoDefaultCredentialsForETL,
+			)
+
+		case "s3-opts", "opts", "options", "hdfs":
+			var args ObjectStorageArguments
+			if err := args.SetFromString(fsPath.ServiceArguments); err != nil {
+				return nil, "", err
+			}
+			args.NoBucketValidation = true
+			args.IsHDFS = fsPath.Service == "hdfs"
+			args.ParallelMode = etlParallelMode(ctx)
+			res, err = NewS3FS(
+				ctx,
+				args,
+				DisabledCacheConfig,
+				nil,
+				true,
+				NoDefaultCredentialsForETL,
+			)
+			if err != nil {
+				return
+			}
+
+		case "minio":
+			arguments := fsPath.ServiceArguments
+			if len(arguments) < 6 {
+				return nil, "", moerr.NewInvalidInputNoCtx("invalid S3 arguments")
+			}
+			endpoint := arguments[0]
+			region := arguments[1]
+			_ = region
+			bucket := arguments[2]
+			accessKey := arguments[3]
+			accessSecret := arguments[4]
+			keyPrefix := arguments[5]
+			var name string
+			if len(arguments) > 6 {
+				name = arguments[6]
+			}
+
+			res, err = NewS3FS(
+				ctx,
+				ObjectStorageArguments{
+					NoBucketValidation: true,
+					Endpoint:           endpoint,
+					Region:             region,
+					Bucket:             bucket,
+					KeyID:              accessKey,
+					KeySecret:          accessSecret,
+					KeyPrefix:          keyPrefix,
+					Name:               name,
+					IsMinio:            true,
+					ParallelMode:       etlParallelMode(ctx),
+				},
+				DisabledCacheConfig,
+				nil,
+				true,
+				NoDefaultCredentialsForETL,
+			)
+			if err != nil {
+				return
+			}
+
+		default:
+			err = moerr.NewInvalidInputNoCtxf("no such service: %s", fsPath.Service)
+		}
+
+		readPath = fsPath.File
+
+	} else {
+		// get etl fs
+		res, err = Get[ETLFileService](fs, fsPath.Service)
+		if err != nil {
+			return nil, "", err
+		}
+		readPath = path
+	}
+
+	return
+}
+
+// LocalBackendOf returns the LocalFS backend ("DISK" or "DISK-V2") whose on-disk
+// format matches fs, for creating a local copy (e.g. a filesystem backup) in the
+// same framing. Raw services (DISK-V2 LocalFS, S3FS, ...) map to "DISK-V2"; only
+// the legacy CRC32-framed LocalFS maps to "DISK". This lets a backup follow the
+// cluster's data fileservice format (the .toml) so restore reads it correctly.
+func LocalBackendOf(fs FileService) string {
+	if lfs, ok := fs.(*LocalFS); ok && !lfs.noChecksum {
+		return diskFileServiceBackend
+	}
+	// Everything else exposes the raw (unframed) on-disk layout — a DISK-V2
+	// LocalFS, S3FS, MemoryFS, ErrorFS, … — so a local copy of their data must
+	// use the DISK-V2 (raw) backend. Only the legacy CRC32-framed LocalFS above
+	// maps to DISK.
+	return diskV2FileServiceBackend
+}
+
+// GetForBackup creates a FileService instance for backup operations.
+// if service part of path is empty, a LocalFS is created; backend selects its
+// on-disk format ("DISK-V2" for raw, anything else incl. "DISK"/empty for the
+// legacy CRC32-framed format). backend is ignored for argumented (s3-opts) specs.
+// if service part of path is argumented, a FileService instance will be created dynamically with those arguments
+// supported dynamic file service:
+// s3-opts,endpoint=<endpoint>,region=<region>,bucket=<bucket>,key=<key>,secret=<secret>,prefix=<prefix>,role-arn=<role arn>,external-id=<external id>,is-minio=<is-minio>
+func GetForBackup(ctx context.Context, spec string, backend string) (res FileService, err error) {
+	fsPath, err := ParsePath(spec)
+	if err != nil {
+		return nil, err
+	}
+
+	if fsPath.Service == "" {
+		// no service, create local fs in the format matching the cluster data
+		if strings.EqualFold(backend, diskV2FileServiceBackend) {
+			res, err = NewLocalFS2(context.Background(), "backup", spec, DisabledCacheConfig, nil)
+		} else {
+			res, err = NewLocalFS(context.Background(), "backup", spec, DisabledCacheConfig, nil)
+		}
+		if err != nil {
+			return nil, err
+		}
+
+	} else if len(fsPath.ServiceArguments) > 0 {
+		// service with arguments, create dynamically
+		switch fsPath.Service {
+
+		case "s3-opts":
+			var args ObjectStorageArguments
+			if err := args.SetFromString(fsPath.ServiceArguments); err != nil {
+				return nil, err
+			}
+			args.NoBucketValidation = true
+			setBackupConnectionPool(&args)
+			res, err = NewS3FS(
+				ctx,
+				args,
+				DisabledCacheConfig,
+				nil,
+				true,
+				false,
+			)
+			if err != nil {
+				return
+			}
+
+		default:
+			err = moerr.NewInvalidInputNoCtxf("no such service: %s", fsPath.Service)
+		}
+
+	} else {
+		return nil, moerr.NewInvalidInputNoCtxf("unknown file service: %v", spec)
+	}
+
+	return
+}
+
+func setBackupConnectionPool(args *ObjectStorageArguments) {
+	if args.MaxConnsPerHost == 0 {
+		// A backup destination must not share the process-wide HTTP pool with
+		// the cluster source file service. A streaming copy retains its source
+		// response while opening the destination request; sharing a saturated
+		// per-host pool would make those two operations wait on each other.
+		args.MaxConnsPerHost = maxConnsPerHost
+	}
+}

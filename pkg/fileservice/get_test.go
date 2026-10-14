@@ -1,0 +1,122 @@
+// Copyright 2022 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package fileservice
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"iter"
+)
+
+func TestGetForBackup(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	fs, err := GetForBackup(ctx, dir, "DISK")
+	assert.Nil(t, err)
+	localFS, ok := fs.(*LocalFS)
+	assert.True(t, ok)
+	assert.Equal(t, dir, localFS.rootPath)
+	assert.False(t, localFS.noChecksum)
+
+	// DISK-V2 backend yields a raw (checksum-free) LocalFS
+	fs2, err := GetForBackup(ctx, t.TempDir(), "DISK-V2")
+	assert.Nil(t, err)
+	localFS2, ok := fs2.(*LocalFS)
+	assert.True(t, ok)
+	assert.True(t, localFS2.noChecksum)
+}
+
+func TestLocalBackendOf(t *testing.T) {
+	ctx := context.Background()
+	disk, err := NewLocalFS(ctx, "s", t.TempDir(), DisabledCacheConfig, nil)
+	assert.Nil(t, err)
+	assert.Equal(t, "DISK", LocalBackendOf(disk))
+
+	diskV2, err := NewLocalFS2(ctx, "s", t.TempDir(), DisabledCacheConfig, nil)
+	assert.Nil(t, err)
+	assert.Equal(t, "DISK-V2", LocalBackendOf(diskV2))
+
+	// non-LocalFS (e.g. memory/S3) is raw -> DISK-V2
+	mem, err := NewMemoryFS("mem", DisabledCacheConfig, nil)
+	assert.Nil(t, err)
+	assert.Equal(t, "DISK-V2", LocalBackendOf(mem))
+}
+
+func TestGetForBackupS3Opts(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	spec := JoinPath("s3-opts,endpoint=disk,bucket="+dir+",prefix=backup-prefix,name=backup", "object")
+	fs, err := GetForBackup(ctx, spec, "DISK")
+	assert.Nil(t, err)
+	s3fs, ok := fs.(*S3FS)
+	assert.True(t, ok)
+	assert.Equal(t, "backup", s3fs.name)
+	assert.Equal(t, "backup-prefix", s3fs.keyPrefix)
+}
+
+func TestBackupObjectStorageUsesDedicatedConnectionPool(t *testing.T) {
+	var args ObjectStorageArguments
+	setBackupConnectionPool(&args)
+
+	assert.Equal(t, maxConnsPerHost, args.MaxConnsPerHost)
+	assert.NotEqual(t, httpRoundTripper, newHTTPClient(args).Transport)
+
+	args.MaxConnsPerHost = 7
+	setBackupConnectionPool(&args)
+	assert.Equal(t, 7, args.MaxConnsPerHost)
+}
+
+type dummyFileService struct{ name string }
+
+func (d dummyFileService) Delete(ctx context.Context, filePaths ...string) error { return nil }
+func (d dummyFileService) Name() string                                          { return d.name }
+func (d dummyFileService) Read(ctx context.Context, vector *IOVector) error      { return nil }
+func (d dummyFileService) ReadCache(ctx context.Context, vector *IOVector) error { return nil }
+func (d dummyFileService) Write(ctx context.Context, vector IOVector) error      { return nil }
+func (d dummyFileService) List(ctx context.Context, dirPath string) iter.Seq2[*DirEntry, error] {
+	return func(yield func(*DirEntry, error) bool) {
+		yield(&DirEntry{Name: "a"}, nil)
+	}
+}
+func (d dummyFileService) StatFile(ctx context.Context, filePath string) (*DirEntry, error) {
+	return &DirEntry{Name: filePath}, nil
+}
+func (d dummyFileService) PrefetchFile(ctx context.Context, filePath string) error { return nil }
+func (d dummyFileService) Cost() *CostAttr                                         { return nil }
+func (d dummyFileService) Close(ctx context.Context)                               {}
+
+func TestGetFromMappings(t *testing.T) {
+	fs1 := dummyFileService{name: "first"}
+	fs2 := dummyFileService{name: "second"}
+	mapping, err := NewFileServices("first", fs1, fs2)
+	assert.NoError(t, err)
+
+	var res FileService
+	res, err = Get[FileService](mapping, "second")
+	assert.NoError(t, err)
+	assert.Equal(t, "second", res.Name())
+
+	_, err = Get[FileService](mapping, "missing")
+	assert.Error(t, err)
+
+	res, err = Get[FileService](fs1, "first")
+	assert.NoError(t, err)
+	assert.Equal(t, "first", res.Name())
+
+	_, err = Get[FileService](fs1, "other")
+	assert.Error(t, err)
+}

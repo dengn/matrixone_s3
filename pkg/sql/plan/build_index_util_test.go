@@ -1,0 +1,301 @@
+// Copyright 2023 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package plan
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/matrixorigin/matrixone/pkg/common/collation"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+	"github.com/stretchr/testify/require"
+)
+
+func keyPartWithLength(colName string, length int) *tree.KeyPart {
+	return &tree.KeyPart{
+		ColName: tree.NewUnresolvedColName(colName),
+		Length:  length,
+	}
+}
+
+func TestIndexNameKeyUsesCanonicalLowercaseInsteadOfSimpleFold(t *testing.T) {
+	require.Equal(t, indexNameKey("MixedCaseIdx"), indexNameKey("mixedcaseidx"))
+	require.Equal(t, indexNameKey("Σ"), indexNameKey("σ"))
+	require.NotEqual(t, indexNameKey("Σ"), indexNameKey("ς"))
+
+	indexes := []*plan.IndexDef{
+		{IndexName: "Σ"},
+		{IndexName: "ς"},
+	}
+	resolved, found := resolveIndexName(indexes, "ς")
+	require.True(t, found)
+	require.Equal(t, "ς", resolved)
+
+	resolved, found = resolveIndexName(indexes, "σ")
+	require.True(t, found)
+	require.Equal(t, "Σ", resolved)
+}
+
+func TestIndexNameKeyIsUsedForDuplicateChecksAndGeneratedNames(t *testing.T) {
+	ctx := context.Background()
+	names := make(map[string]bool)
+
+	require.NoError(t, checkDuplicateConstraint(names, "Σ", false, ctx))
+	require.NoError(t, checkDuplicateConstraint(names, "ς", false, ctx))
+	require.Error(t, checkDuplicateConstraint(names, "σ", false, ctx))
+
+	ordinary := &tree.Index{KeyParts: []*tree.KeyPart{keyPartWithLength("ς", 0)}}
+	setEmptyIndexName(map[string]bool{indexNameKey("Σ"): true}, ordinary)
+	require.Equal(t, "ς", ordinary.Name)
+
+	unique := &tree.UniqueIndex{KeyParts: []*tree.KeyPart{keyPartWithLength("σ", 0)}}
+	setEmptyUniqueIndexName(map[string]bool{indexNameKey("Σ"): true}, unique)
+	require.Equal(t, "σ_2", unique.Name)
+
+	fulltext := &tree.FullTextIndex{KeyParts: []*tree.KeyPart{keyPartWithLength("σ", 0)}}
+	setEmptyFullTextIndexName(map[string]bool{indexNameKey("Σ"): true}, fulltext)
+	require.Equal(t, "σ_2", fulltext.Name)
+}
+
+func TestIndexTableKeyTypeForPrefix(t *testing.T) {
+	tests := []struct {
+		name     string
+		typeId   types.T
+		wantOk   bool
+		wantId   types.T
+		wantWide int32
+	}{
+		{name: "text", typeId: types.T_text, wantOk: true, wantId: types.T_varchar, wantWide: types.MaxVarcharLen},
+		{name: "blob", typeId: types.T_blob, wantOk: true, wantId: types.T_varbinary, wantWide: types.MaxVarBinaryLen},
+		{name: "varchar not prefixable", typeId: types.T_varchar, wantOk: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := indexTableKeyTypeForPrefix(Type{Id: int32(tt.typeId)})
+			require.Equal(t, tt.wantOk, ok)
+			if tt.wantOk {
+				require.Equal(t, int32(tt.wantId), got.Id)
+				require.Equal(t, tt.wantWide, got.Width)
+			}
+		})
+	}
+}
+
+func TestIndexTableKeyTypeForSinglePart(t *testing.T) {
+	t.Run("nil column returns empty type", func(t *testing.T) {
+		require.Equal(t, Type{}, indexTableKeyTypeForSinglePartWithFormat(nil, keyPartWithLength("t", 10), collation.KeyFormatLegacy))
+	})
+
+	t.Run("text prefix maps to varchar", func(t *testing.T) {
+		col := &ColDef{Typ: Type{Id: int32(types.T_text), Width: int32(types.MaxVarcharLen)}}
+		got := indexTableKeyTypeForSinglePartWithFormat(col, keyPartWithLength("t", 10), collation.KeyFormatLegacy)
+		require.Equal(t, int32(types.T_varchar), got.Id)
+		require.Equal(t, int32(types.MaxVarcharLen), got.Width)
+	})
+
+	t.Run("blob prefix maps to varbinary", func(t *testing.T) {
+		col := &ColDef{Typ: Type{Id: int32(types.T_blob), Width: int32(types.MaxVarBinaryLen)}}
+		got := indexTableKeyTypeForSinglePartWithFormat(col, keyPartWithLength("b", 10), collation.KeyFormatLegacy)
+		require.Equal(t, int32(types.T_varbinary), got.Id)
+		require.Equal(t, int32(types.MaxVarBinaryLen), got.Width)
+	})
+
+	t.Run("non prefixable column keeps original type even with length", func(t *testing.T) {
+		col := &ColDef{Typ: Type{Id: int32(types.T_varchar), Width: 50, Scale: 0}}
+		got := indexTableKeyTypeForSinglePartWithFormat(col, keyPartWithLength("v", 10), collation.KeyFormatLegacy)
+		require.Equal(t, int32(types.T_varchar), got.Id)
+		require.Equal(t, int32(50), got.Width)
+	})
+
+	t.Run("no length keeps original type", func(t *testing.T) {
+		col := &ColDef{Typ: Type{Id: int32(types.T_text), Width: 100, Scale: 2}}
+		got := indexTableKeyTypeForSinglePartWithFormat(col, keyPartWithLength("t", 0), collation.KeyFormatLegacy)
+		require.Equal(t, int32(types.T_text), got.Id)
+		require.Equal(t, int32(100), got.Width)
+		require.Equal(t, int32(2), got.Scale)
+	})
+
+	t.Run("nil key part keeps original type", func(t *testing.T) {
+		col := &ColDef{Typ: Type{Id: int32(types.T_text), Width: 100}}
+		got := indexTableKeyTypeForSinglePartWithFormat(col, nil, collation.KeyFormatLegacy)
+		require.Equal(t, int32(types.T_text), got.Id)
+		require.Equal(t, int32(100), got.Width)
+	})
+
+	t.Run("enum preserves enumvalues", func(t *testing.T) {
+		col := &ColDef{Typ: Type{Id: int32(types.T_enum), Enumvalues: "new,paid,shipped"}}
+		got := indexTableKeyTypeForSinglePartWithFormat(col, keyPartWithLength("e", 0), collation.KeyFormatLegacy)
+		require.Equal(t, int32(types.T_enum), got.Id)
+		require.Equal(t, "new,paid,shipped", got.Enumvalues)
+	})
+
+	// SET columns are rejected for UNIQUE indexes (checkIndexColumnSupportability),
+	// so indexTableKeyTypeForSinglePart is unreachable for SET in practice.
+	// This test only guards against accidental regressions in the helper itself.
+	t.Run("set preserves enumvalues (defensive, unreachable path)", func(t *testing.T) {
+		col := &ColDef{Typ: Type{Id: int32(types.T_uint64), Enumvalues: "a,b,c"}}
+		got := indexTableKeyTypeForSinglePartWithFormat(col, keyPartWithLength("s", 0), collation.KeyFormatLegacy)
+		require.Equal(t, int32(types.T_uint64), got.Id)
+		require.Equal(t, "a,b,c", got.Enumvalues)
+	})
+
+	t.Run("versioned unicode key uses opaque binary payload", func(t *testing.T) {
+		col := &ColDef{Typ: Type{
+			Id:      int32(types.T_varchar),
+			Width:   64,
+			Charset: uint32(types.CharsetUTF8MB4UnicodeCI),
+		}}
+		got := indexTableKeyTypeForSinglePartWithFormat(col, keyPartWithLength("u", 0), collation.KeyFormatV1)
+		require.Equal(t, int32(types.T_varbinary), got.Id)
+		require.Equal(t, int32(types.MaxVarBinaryLen), got.Width)
+		require.Equal(t, uint32(types.CharsetBinary), got.Charset)
+
+		legacy := indexTableKeyTypeForSinglePartWithFormat(col, keyPartWithLength("u", 0), collation.KeyFormatLegacy)
+		require.Equal(t, int32(types.T_varchar), legacy.Id)
+		require.Equal(t, uint32(types.CharsetUTF8MB4UnicodeCI), legacy.Charset)
+	})
+
+	t.Run("versioned unicode text prefix uses opaque binary payload", func(t *testing.T) {
+		col := Type{Id: int32(types.T_text), Charset: uint32(types.CharsetUTF8MB4UnicodeCI)}
+		got, ok := indexTableKeyTypeForPrefixWithFormat(col, collation.KeyFormatV1)
+		require.True(t, ok)
+		require.Equal(t, int32(types.T_varbinary), got.Id)
+		require.Equal(t, uint32(types.CharsetBinary), got.Charset)
+	})
+
+	t.Run("versioned unicode primary payload uses opaque binary type", func(t *testing.T) {
+		col := &ColDef{Typ: Type{
+			Id:      int32(types.T_varchar),
+			Width:   64,
+			Charset: uint32(types.CharsetUTF8MB4UnicodeCI),
+		}}
+		got := indexTablePrimaryKeyTypeWithFormat(col, collation.KeyFormatV1)
+		require.Equal(t, int32(types.T_varbinary), got.Id)
+		require.Equal(t, int32(types.MaxVarBinaryLen), got.Width)
+		require.Equal(t, uint32(types.CharsetBinary), got.Charset)
+
+		legacy := indexTablePrimaryKeyTypeWithFormat(col, collation.KeyFormatLegacy)
+		require.Equal(t, int32(types.T_varchar), legacy.Id)
+		require.Equal(t, uint32(types.CharsetUTF8MB4UnicodeCI), legacy.Charset)
+	})
+}
+
+func TestIndexColumnCheckKind(t *testing.T) {
+	tests := []struct {
+		indexType tree.IndexType
+		want      string
+	}{
+		{tree.INDEX_TYPE_IVFFLAT, "ivfflat"},
+		{tree.INDEX_TYPE_HNSW, "hnsw"},
+		{tree.INDEX_TYPE_RTREE, "rtree"},
+		{tree.INDEX_TYPE_BTREE, "secondary"},
+		{tree.INDEX_TYPE_INVALID, "secondary"},
+	}
+
+	for _, tt := range tests {
+		require.Equal(t, tt.want, indexColumnCheckKind(tt.indexType))
+	}
+}
+
+func TestCheckIndexColumnSupportability(t *testing.T) {
+	ctx := context.Background()
+
+	colOf := func(typeId types.T, enumValues ...string) *ColDef {
+		typ := plan.Type{Id: int32(typeId)}
+		if len(enumValues) > 0 {
+			typ.Enumvalues = strings.Join(enumValues, ",")
+		}
+		return &ColDef{Name: "c", Typ: typ}
+	}
+	keyPart := keyPartWithLength("c", 0)
+	prefixKeyPart := keyPartWithLength("c", 10)
+
+	t.Run("nil inputs", func(t *testing.T) {
+		require.Error(t, checkIndexColumnSupportability(ctx, nil, keyPart, "secondary"))
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_int64), nil, "secondary"))
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_int64), &tree.KeyPart{}, "secondary"))
+	})
+
+	t.Run("blob requires prefix in non-primary index", func(t *testing.T) {
+		require.NoError(t, checkIndexColumnSupportability(ctx, colOf(types.T_blob), prefixKeyPart, "secondary"))
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_blob), keyPart, "secondary"))
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_blob), prefixKeyPart, "primary"))
+	})
+
+	t.Run("text requires prefix in non-primary index", func(t *testing.T) {
+		require.NoError(t, checkIndexColumnSupportability(ctx, colOf(types.T_text), prefixKeyPart, "unique"))
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_text), keyPart, "secondary"))
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_text), prefixKeyPart, "primary"))
+	})
+
+	t.Run("datalink and json never allowed", func(t *testing.T) {
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_datalink), keyPart, "secondary"))
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_json), keyPart, "secondary"))
+	})
+
+	t.Run("vector type support is delegated to the plugin per algo", func(t *testing.T) {
+		// ivfflat accepts every vector element type (f32/f64 + narrow f16/bf16/int8/uint8).
+		for _, ty := range []types.T{
+			types.T_array_float32, types.T_array_float64, types.T_array_float16,
+			types.T_array_bf16, types.T_array_int8, types.T_array_uint8,
+		} {
+			require.NoError(t, checkIndexColumnSupportability(ctx, colOf(ty), keyPart, "ivfflat"))
+		}
+		require.NoError(t, checkIndexColumnSupportability(ctx, colOf(types.T_array_float64), keyPart, "hnsw"))
+		// A vector column in a non-vector index kind has no plugin → rejected,
+		// for both wide and narrow element types.
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_array_float32), keyPart, "secondary"))
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_array_int8), keyPart, "secondary"))
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_array_float16), keyPart, "unique"))
+	})
+
+	t.Run("enum allowed in indexes", func(t *testing.T) {
+		require.NoError(t, checkIndexColumnSupportability(ctx, colOf(types.T_enum, "a", "b"), keyPart, "primary"))
+		require.NoError(t, checkIndexColumnSupportability(ctx, colOf(types.T_enum, "a", "b"), keyPart, "secondary"))
+		require.NoError(t, checkIndexColumnSupportability(ctx, colOf(types.T_enum, "a", "b"), keyPart, "unique"))
+	})
+
+	t.Run("native unicode is rejected only for unique indexes", func(t *testing.T) {
+		typ := plan.Type{
+			Id:      int32(types.T_varchar),
+			Charset: uint32(types.CharsetUTF8MB4UnicodeCI),
+		}
+		unicodeCol := &ColDef{Name: "c", Typ: typ}
+		require.Error(t, checkIndexColumnSupportability(ctx, unicodeCol, keyPart, "unique"))
+		require.NoError(t, checkIndexColumnSupportability(ctx, colOf(types.T_varchar), keyPart, "unique"))
+	})
+
+	t.Run("set rejected in primary and unique", func(t *testing.T) {
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_uint64, "a", "b"), keyPart, "primary"))
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_uint64, "a", "b"), keyPart, "unique"))
+		require.NoError(t, checkIndexColumnSupportability(ctx, colOf(types.T_uint64, "a", "b"), keyPart, "secondary"))
+	})
+
+	t.Run("geometry only allowed for rtree", func(t *testing.T) {
+		require.NoError(t, checkIndexColumnSupportability(ctx, colOf(types.T_geometry), keyPart, "rtree"))
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_geometry), keyPart, "primary"))
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_geometry), keyPart, "unique"))
+		require.Error(t, checkIndexColumnSupportability(ctx, colOf(types.T_geometry), keyPart, "secondary"))
+	})
+
+	t.Run("ordinary column allowed", func(t *testing.T) {
+		require.NoError(t, checkIndexColumnSupportability(ctx, colOf(types.T_int64), keyPart, "primary"))
+		require.NoError(t, checkIndexColumnSupportability(ctx, colOf(types.T_varchar), keyPart, "secondary"))
+	})
+}

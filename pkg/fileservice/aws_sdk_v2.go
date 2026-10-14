@@ -1,0 +1,1292 @@
+// Copyright 2023 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package fileservice
+
+import (
+	"bytes"
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"iter"
+	"math"
+	nethttp "net/http"
+	"net/url"
+	gotrace "runtime/trace"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	"github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	smithy "github.com/aws/smithy-go"
+	"go.uber.org/zap"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/perfcounter"
+	"github.com/matrixorigin/matrixone/pkg/util/trace"
+)
+
+type AwsSDKv2 struct {
+	name                 string
+	endpoint             string
+	bucket               string
+	client               *s3.Client
+	copyCredentialDomain objectStorageCopyCredentialDomain
+	perfCounterSets      []*perfcounter.CounterSet
+	listMaxKeys          int32
+	disableMultiDelete   atomic.Bool
+}
+
+const awsMultipartAbortTimeout = 30 * time.Second
+
+var _ objectStorageCopier = new(AwsSDKv2)
+var _ objectStorageIdentityReader = new(AwsSDKv2)
+
+func (a *AwsSDKv2) CopyObject(
+	ctx context.Context,
+	src ObjectStorage,
+	srcKey string,
+	dstKey string,
+) (bool, error) {
+	s, ok := src.(*AwsSDKv2)
+	if !ok || !strings.EqualFold(a.endpoint, s.endpoint) ||
+		!a.copyCredentialDomain.matches(s.copyCredentialDomain) {
+		return false, nil
+	}
+	_, err := a.client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(a.bucket),
+		CopySource: aws.String(url.PathEscape(s.bucket + "/" + srcKey)),
+		Key:        aws.String(dstKey),
+	})
+	return true, err
+}
+
+func NewAwsSDKv2(
+	ctx context.Context,
+	args ObjectStorageArguments,
+	perfCounterSets []*perfcounter.CounterSet,
+) (*AwsSDKv2, error) {
+
+	if err := args.validate(); err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeoutCause(ctx, time.Minute, moerr.CauseNewAwsSDKv2)
+	defer cancel()
+
+	// options for loading configs
+	loadConfigOptions := []func(*config.LoadOptions) error{
+		config.WithLogger(logutil.GetS3Logger()),
+		// Keep the pre-v1.99 S3 behavior for existing object-storage
+		// deployments. Newer AWS SDKs default to calculating and validating
+		// checksums whenever an operation supports them, which changes the
+		// wire contract for S3-compatible services. Required checksums remain
+		// enabled while optional checksums stay disabled until each backend has
+		// an explicit compatibility test.
+		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
+		config.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
+		config.WithClientLogMode(
+			aws.LogSigning |
+				aws.LogRetries |
+				aws.LogRequest |
+				aws.LogResponse |
+				aws.LogDeprecatedUsage |
+				aws.LogRequestEventMessage |
+				aws.LogResponseEventMessage,
+		),
+		config.WithHTTPClient(newHTTPClient(args)),
+	}
+
+	// shared config profile
+	if args.SharedConfigProfile != "" {
+		loadConfigOptions = append(loadConfigOptions,
+			config.WithSharedConfigProfile(args.SharedConfigProfile),
+		)
+	}
+
+	credentialProvider, err := args.credentialsProviderForAwsSDKv2(ctx)
+	if err != nil {
+		return nil, moerr.AttachCause(ctx, err)
+	}
+
+	// validate
+	var copyCredentialDomain objectStorageCopyCredentialDomain
+	if credentialProvider != nil {
+		credential, retrieveErr := credentialProvider.Retrieve(ctx)
+		err = retrieveErr
+		if err != nil {
+			return nil, moerr.AttachCause(ctx, err)
+		}
+		copyCredentialDomain = newObjectStorageCopyCredentialDomain(
+			credential.AccessKeyID, credential.SecretAccessKey, credential.SessionToken,
+		)
+	}
+
+	// load configs
+	if credentialProvider != nil {
+		loadConfigOptions = append(loadConfigOptions,
+			config.WithCredentialsProvider(
+				credentialProvider,
+			),
+		)
+	}
+
+	// http client
+	httpClient := newHTTPClient(args)
+	loadConfigOptions = append(loadConfigOptions, config.WithHTTPClient(httpClient))
+
+	config, err := config.LoadDefaultConfig(ctx, loadConfigOptions...)
+	if err != nil {
+		return nil, moerr.AttachCause(ctx, err)
+	}
+
+	// options for s3 client
+	s3Options := []func(*s3.Options){
+		func(opts *s3.Options) {
+			opts.Retryer = newAWSRetryer()
+			opts.HTTPClient = httpClient
+		},
+	}
+
+	// credential provider for s3 client
+	if credentialProvider != nil {
+		s3Options = append(s3Options,
+			func(opt *s3.Options) {
+				opt.Credentials = credentialProvider
+			},
+		)
+	}
+
+	// endpoint for s3 client
+	if args.Endpoint != "" {
+		s3Options = append(s3Options, func(opts *s3.Options) {
+			opts.BaseEndpoint = aws.String(args.Endpoint)
+		})
+		if args.IsMinio {
+			// special handling for MinIO
+			s3Options = append(s3Options,
+				func(opts *s3.Options) {
+					opts.EndpointOptions.ResolvedRegion = args.Region
+				},
+			)
+		}
+	}
+
+	// region for s3 client
+	if args.Region != "" {
+		s3Options = append(s3Options,
+			func(opt *s3.Options) {
+				opt.Region = args.Region
+			},
+		)
+	}
+
+	// new s3 client
+	client := s3.NewFromConfig(
+		config,
+		s3Options...,
+	)
+
+	logutil.Info("new object storage",
+		zap.Any("sdk", "aws v2"),
+		zap.Any("arguments", args),
+	)
+
+	if !args.NoBucketValidation {
+		// head bucket to validate
+		_, err = client.HeadBucket(ctx, &s3.HeadBucketInput{
+			Bucket: ptrTo(args.Bucket),
+		})
+		if err != nil {
+			err = moerr.AttachCause(ctx, err)
+			return nil, moerr.NewInternalErrorNoCtxf("bad s3 config: %v", err)
+		}
+	}
+
+	return &AwsSDKv2{
+		name:                 args.Name,
+		endpoint:             args.Endpoint,
+		bucket:               args.Bucket,
+		client:               client,
+		copyCredentialDomain: copyCredentialDomain,
+		perfCounterSets:      perfCounterSets,
+	}, nil
+
+}
+
+var _ ObjectStorage = new(AwsSDKv2)
+var _ ParallelMultipartWriter = new(AwsSDKv2)
+
+func (a *AwsSDKv2) List(
+	ctx context.Context,
+	prefix string,
+) iter.Seq2[*DirEntry, error] {
+	return func(yield func(*DirEntry, error) bool) {
+		select {
+		case <-ctx.Done():
+			yield(nil, ctx.Err())
+			return
+		default:
+		}
+
+		var marker *string
+
+	loop1:
+		for {
+			output, err := a.listObjects(
+				ctx,
+				&s3.ListObjectsInput{
+					Bucket:    ptrTo(a.bucket),
+					Delimiter: ptrTo("/"),
+					Prefix:    zeroToNil(prefix),
+					Marker:    marker,
+					MaxKeys:   zeroToNil(a.listMaxKeys),
+				},
+			)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+
+			for _, obj := range output.Contents {
+				if !yield(&DirEntry{
+					Name: *obj.Key,
+					Size: *obj.Size,
+				}, nil) {
+					break loop1
+				}
+			}
+
+			for _, prefix := range output.CommonPrefixes {
+				if !yield(&DirEntry{
+					IsDir: true,
+					Name:  *prefix.Prefix,
+				}, nil) {
+					break loop1
+				}
+			}
+
+			if !*output.IsTruncated {
+				break
+			}
+			marker = output.NextMarker
+		}
+
+	}
+}
+
+func (a *AwsSDKv2) Stat(
+	ctx context.Context,
+	key string,
+) (
+	size int64,
+	err error,
+) {
+
+	select {
+	case <-ctx.Done():
+		err = ctx.Err()
+		return
+	default:
+	}
+
+	output, err := a.headObject(
+		ctx,
+		&s3.HeadObjectInput{
+			Bucket: ptrTo(a.bucket),
+			Key:    ptrTo(key),
+		},
+	)
+	if err != nil {
+		var httpError *http.ResponseError
+		if errors.As(err, &httpError) {
+			if httpError.Response.StatusCode == 404 {
+				err = moerr.NewFileNotFound(ctx, key)
+				return
+			}
+		}
+		return
+	}
+
+	size = *output.ContentLength
+
+	return
+}
+
+func (a *AwsSDKv2) StatObjectIdentity(ctx context.Context, key string) (ObjectIdentity, error) {
+	output, err := a.headObject(ctx, &s3.HeadObjectInput{
+		Bucket: ptrTo(a.bucket),
+		Key:    ptrTo(key),
+	})
+	if err != nil {
+		return ObjectIdentity{}, a.mapError(err, key)
+	}
+	identity := ObjectIdentity{
+		Size:      aws.ToInt64(output.ContentLength),
+		ETag:      aws.ToString(output.ETag),
+		VersionID: aws.ToString(output.VersionId),
+	}
+	if output.LastModified != nil {
+		identity.LastModified = *output.LastModified
+	}
+	return identity, identity.Validate()
+}
+
+func (a *AwsSDKv2) ReadObjectWithIdentity(
+	ctx context.Context,
+	key string,
+	min *int64,
+	max *int64,
+	expected ObjectIdentity,
+) (io.ReadCloser, error) {
+	if err := expected.Validate(); err != nil {
+		return nil, err
+	}
+	params := &s3.GetObjectInput{Bucket: ptrTo(a.bucket), Key: ptrTo(key)}
+	if expected.VersionID != "" {
+		params.VersionId = ptrTo(expected.VersionID)
+	} else {
+		params.IfMatch = ptrTo(expected.ETag)
+	}
+	r, err := a.getObject(ctx, min, max, params)
+	if err != nil {
+		// Preserve the conditional-read contract before the ordinary S3 mapper
+		// turns a deleted planned version into a generic file-not-found error.
+		return nil, a.mapError(mapAWSConditionalReadError(err), key)
+	}
+	r = mapReadCloserErrors(r, mapAWSConditionalReadError)
+	if max == nil {
+		return r, nil
+	}
+	return &readCloser{
+		r:         io.LimitReader(r, *max-*min),
+		closeFunc: r.Close,
+	}, nil
+}
+
+func mapAWSConditionalReadError(err error) error {
+	var responseError *http.ResponseError
+	if errors.As(err, &responseError) && responseError.Response != nil &&
+		(responseError.Response.StatusCode == nethttp.StatusNotFound ||
+			responseError.Response.StatusCode == nethttp.StatusPreconditionFailed) {
+		return errors.Join(ErrObjectChanged, moerr.NewInternalErrorNoCtx("conditional S3 read failed"))
+	}
+	return err
+}
+
+func (a *AwsSDKv2) Exists(
+	ctx context.Context,
+	key string,
+) (
+	bool,
+	error,
+) {
+	output, err := a.headObject(
+		ctx,
+		&s3.HeadObjectInput{
+			Bucket: ptrTo(a.bucket),
+			Key:    ptrTo(key),
+		},
+	)
+	if err != nil {
+		var httpError *http.ResponseError
+		if errors.As(err, &httpError) {
+			if httpError.Response.StatusCode == 404 {
+				return false, nil
+			}
+		}
+		return false, err
+	}
+	return output != nil, nil
+}
+
+func (a *AwsSDKv2) Write(
+	ctx context.Context,
+	key string,
+	r io.Reader,
+	sizeHint *int64,
+	expire *time.Time,
+) (
+	err error,
+) {
+	defer wrapSizeMismatchErr(&err)
+
+	if sizeHint == nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		content, readErr := io.ReadAll(io.LimitReader(r, 64*(1<<20)))
+		if readErr != nil {
+			return readErr
+		}
+		if len(content) == 0 {
+			size := int64(0)
+			return a.Write(ctx, key, bytes.NewReader(nil), &size, expire)
+		}
+
+		// multipart
+		output, createErr := DoWithRetryContext(ctx, "create multipart upload", func() (*s3.CreateMultipartUploadOutput, error) {
+			return a.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+				Bucket:  ptrTo(a.bucket),
+				Key:     ptrTo(key),
+				Expires: expire,
+			})
+		}, maxRetryAttemps, IsRetryableError)
+		if createErr != nil {
+			return createErr
+		}
+
+		defer func() {
+			// abort
+			if err != nil {
+				abortErr := a.abortMultipartUpload(ctx, key, output.UploadId, awsMultipartAbortTimeout)
+				err = errors.Join(err, abortErr)
+			}
+		}()
+
+		// upload
+		num := int32(1)
+		completed := new(types.CompletedMultipartUpload)
+		for len(content) > 0 {
+			uploadOutput, uploadErr := DoWithRetryContext(ctx, "upload part", func() (*s3.UploadPartOutput, error) {
+				recordS3PutRequest(ctx, a.perfCounterSets...)
+				return a.client.UploadPart(ctx, &s3.UploadPartInput{
+					Bucket:     ptrTo(a.bucket),
+					Key:        ptrTo(key),
+					PartNumber: &num,
+					UploadId:   output.UploadId,
+					Body:       bytes.NewReader(content),
+				})
+			}, maxRetryAttemps, IsRetryableError)
+			if uploadErr != nil {
+				return uploadErr
+			}
+			recordS3AcceptedBytes(ctx, int64(len(content)), a.perfCounterSets...)
+			completed.Parts = append(completed.Parts, types.CompletedPart{
+				ETag:       uploadOutput.ETag,
+				PartNumber: ptrTo(num),
+			})
+			num++
+			content, err = io.ReadAll(io.LimitReader(r, 64*(1<<20)))
+			if err != nil {
+				return err
+			}
+		}
+
+		// complete
+		_, err = DoWithRetryContext(ctx, "complete multipart upload", func() (*s3.CompleteMultipartUploadOutput, error) {
+			return a.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+				Bucket:          ptrTo(a.bucket),
+				Key:             ptrTo(key),
+				UploadId:        output.UploadId,
+				MultipartUpload: completed,
+			})
+		}, maxRetryAttemps, IsRetryableError)
+		if err != nil {
+			return err
+		}
+
+	} else if *sizeHint < smallObjectThreshold {
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return err
+		}
+		_, err = DoWithRetryContext(ctx, "write", func() (*s3.PutObjectOutput, error) {
+			return a.putObject(
+				ctx,
+				&s3.PutObjectInput{
+					Bucket:        ptrTo(a.bucket),
+					Key:           ptrTo(key),
+					Body:          bytes.NewReader(data),
+					ContentLength: sizeHint,
+					Expires:       expire,
+				},
+				func(opts *s3.Options) {
+					opts.Retryer = aws.NopRetryer{}
+				},
+			)
+		}, maxRetryAttemps, IsRetryableError)
+		if err != nil {
+			return err
+		}
+
+	} else {
+		if _, ok := r.(io.Seeker); !ok {
+			// Large non-seekable readers are incompatible with the raw PutObject path
+			// on some S3-compatible backends (for example OBS behind non-TLS or custom
+			// payload-hash behavior). Fall back to multipart upload with concurrency=1
+			// so callers do not need parallel-mode=1 just to avoid the 64MB raw PUT path.
+			return a.WriteMultipartParallel(ctx, key, r, sizeHint, &ParallelMultipartOption{
+				PartSize:    defaultParallelMultipartPartSize,
+				Concurrency: 1,
+				Expire:      expire,
+			})
+		}
+		_, err = a.putObject(
+			ctx,
+			&s3.PutObjectInput{
+				Bucket:        ptrTo(a.bucket),
+				Key:           ptrTo(key),
+				Body:          r,
+				ContentLength: sizeHint,
+				Expires:       expire,
+			},
+			func(opts *s3.Options) {
+				opts.Retryer = aws.NopRetryer{}
+			},
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	return
+}
+
+// abortMultipartUpload keeps cleanup alive after caller cancellation while
+// bounding the time a failed write can spend waiting for S3 to respond.
+func (a *AwsSDKv2) abortMultipartUpload(ctx context.Context, key string, uploadID *string, timeout time.Duration) error {
+	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+	_, err := a.client.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
+		Bucket:   ptrTo(a.bucket),
+		Key:      ptrTo(key),
+		UploadId: uploadID,
+	})
+	return err
+}
+
+func (a *AwsSDKv2) SupportsParallelMultipart() bool {
+	return true
+}
+
+func (a *AwsSDKv2) WriteMultipartParallel(
+	ctx context.Context,
+	key string,
+	r io.Reader,
+	sizeHint *int64,
+	opt *ParallelMultipartOption,
+) (err error) {
+	defer wrapSizeMismatchErr(&err)
+
+	options := normalizeParallelOption(opt)
+	if sizeHint != nil {
+		r = &exactSizeReader{
+			R:        r,
+			Expected: *sizeHint,
+			Key:      key,
+		}
+		if *sizeHint < minMultipartPartSize {
+			return a.Write(ctx, key, r, sizeHint, options.Expire)
+		}
+		expectedParts := (*sizeHint + options.PartSize - 1) / options.PartSize
+		if expectedParts > maxMultipartParts {
+			return moerr.NewInternalErrorNoCtxf("too many parts for multipart upload: %d", expectedParts)
+		}
+	}
+
+	parentCtx := ctx
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type partBuffer struct {
+		buf    []byte
+		n      int
+		tokens int64
+	}
+
+	releasePartBuffer := func(part *partBuffer) {
+		if part == nil {
+			return
+		}
+		releaseParallelUploadBufferBudget(part.tokens)
+	}
+
+	readChunk := func() (*partBuffer, error) {
+		tokens, err := acquireParallelUploadBufferBudget(ctx, int64(options.PartSize))
+		if err != nil {
+			return nil, err
+		}
+		raw := make([]byte, options.PartSize)
+		n, err := io.ReadFull(r, raw)
+		switch {
+		case errors.Is(err, io.EOF):
+			releaseParallelUploadBufferBudget(tokens)
+			return nil, io.EOF
+		case errors.Is(err, io.ErrUnexpectedEOF):
+			return &partBuffer{buf: raw, n: n, tokens: tokens}, io.EOF
+		case err != nil:
+			releaseParallelUploadBufferBudget(tokens)
+			return nil, err
+		default:
+			return &partBuffer{buf: raw, n: n, tokens: tokens}, nil
+		}
+	}
+
+	firstPart, err := readChunk()
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	if firstPart == nil && errors.Is(err, io.EOF) {
+		size := int64(0)
+		return a.Write(ctx, key, bytes.NewReader(nil), &size, options.Expire)
+	}
+	if errors.Is(err, io.EOF) && int64(firstPart.n) < minMultipartPartSize {
+		data := make([]byte, firstPart.n)
+		copy(data, firstPart.buf[:firstPart.n])
+		size := int64(firstPart.n)
+		releasePartBuffer(firstPart)
+		return a.Write(ctx, key, bytes.NewReader(data), &size, options.Expire)
+	}
+
+	output, createErr := DoWithRetryContext(ctx, "create multipart upload", func() (*s3.CreateMultipartUploadOutput, error) {
+		return a.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket:  ptrTo(a.bucket),
+			Key:     ptrTo(key),
+			Expires: options.Expire,
+		})
+	}, maxRetryAttemps, IsRetryableError)
+	if createErr != nil {
+		releasePartBuffer(firstPart)
+		return createErr
+	}
+
+	defer func() {
+		if err != nil {
+			abortErr := a.abortMultipartUpload(parentCtx, key, output.UploadId, awsMultipartAbortTimeout)
+			err = errors.Join(err, abortErr)
+		}
+	}()
+
+	type partJob struct {
+		num  int32
+		part *partBuffer
+	}
+
+	var (
+		partNum   int32
+		parts     []types.CompletedPart
+		partsLock sync.Mutex
+		wg        sync.WaitGroup
+		errOnce   sync.Once
+		firstErr  error
+	)
+
+	setErr := func(e error) {
+		if e == nil {
+			return
+		}
+		errOnce.Do(func() {
+			firstErr = e
+			cancel()
+		})
+	}
+
+	uploadSlots := make(chan struct{}, options.Concurrency)
+	startPartUpload := func(job partJob) bool {
+		select {
+		case uploadSlots <- struct{}{}:
+		case <-ctx.Done():
+			releasePartBuffer(job.part)
+			setErr(ctx.Err())
+			return false
+		}
+		select {
+		case getParallelUploadSemaphore() <- struct{}{}:
+		case <-ctx.Done():
+			<-uploadSlots
+			releasePartBuffer(job.part)
+			setErr(ctx.Err())
+			return false
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				<-getParallelUploadSemaphore()
+				<-uploadSlots
+			}()
+			if options.beforePartUpload != nil {
+				options.beforePartUpload()
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				setErr(ctxErr)
+				releasePartBuffer(job.part)
+				return
+			}
+			uploadOutput, uploadErr := DoWithRetryContext(ctx, "upload part", func() (*s3.UploadPartOutput, error) {
+				recordS3PutRequest(ctx, a.perfCounterSets...)
+				return a.client.UploadPart(ctx, &s3.UploadPartInput{
+					Bucket:     ptrTo(a.bucket),
+					Key:        ptrTo(key),
+					PartNumber: &job.num,
+					UploadId:   output.UploadId,
+					Body:       bytes.NewReader(job.part.buf[:job.part.n]),
+				})
+			}, maxRetryAttemps, IsRetryableError)
+			if uploadErr != nil {
+				setErr(uploadErr)
+				releasePartBuffer(job.part)
+				return
+			}
+			recordS3AcceptedBytes(ctx, int64(job.part.n), a.perfCounterSets...)
+			releasePartBuffer(job.part)
+			partsLock.Lock()
+			parts = append(parts, types.CompletedPart{
+				ETag:       uploadOutput.ETag,
+				PartNumber: ptrTo(job.num),
+			})
+			partsLock.Unlock()
+		}()
+		return true
+	}
+
+	sendJob := func(part *partBuffer) bool {
+		partNum++
+		if partNum > maxMultipartParts {
+			setErr(moerr.NewInternalErrorNoCtxf("too many parts for multipart upload: %d", partNum))
+			releasePartBuffer(part)
+			return false
+		}
+		job := partJob{
+			num:  partNum,
+			part: part,
+		}
+		return startPartUpload(job)
+	}
+
+	if sendJob(firstPart) {
+		for {
+			part, readErr := readChunk()
+			if errors.Is(readErr, io.EOF) && part == nil {
+				break
+			}
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
+				setErr(readErr)
+				releasePartBuffer(part)
+				break
+			}
+			if part == nil || part.n == 0 {
+				releasePartBuffer(part)
+				break
+			}
+			if !sendJob(part) {
+				break
+			}
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+		}
+	}
+
+	wg.Wait()
+
+	if firstErr != nil {
+		err = firstErr
+		return err
+	}
+	if len(parts) != int(partNum) {
+		return moerr.NewInternalErrorNoCtxf("multipart upload incomplete, expect %d parts got %d", partNum, len(parts))
+	}
+
+	slices.SortFunc(parts, func(a, b types.CompletedPart) int {
+		return cmp.Compare(*a.PartNumber, *b.PartNumber)
+	})
+
+	_, err = DoWithRetryContext(ctx, "complete multipart upload", func() (*s3.CompleteMultipartUploadOutput, error) {
+		return a.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket:          ptrTo(a.bucket),
+			Key:             ptrTo(key),
+			UploadId:        output.UploadId,
+			MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+		})
+	}, maxRetryAttemps, IsRetryableError)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (a *AwsSDKv2) Read(
+	ctx context.Context,
+	key string,
+	min *int64,
+	max *int64,
+) (
+	r io.ReadCloser,
+	err error,
+) {
+
+	if max == nil {
+		// read to end
+		r, err := a.getObject(
+			ctx,
+			min,
+			nil,
+			&s3.GetObjectInput{
+				Bucket: ptrTo(a.bucket),
+				Key:    ptrTo(key),
+			},
+		)
+		err = a.mapError(err, key)
+		if err != nil {
+			return nil, err
+		}
+		return r, nil
+	}
+
+	r, err = a.getObject(
+		ctx,
+		min,
+		max,
+		&s3.GetObjectInput{
+			Bucket: ptrTo(a.bucket),
+			Key:    ptrTo(key),
+		},
+	)
+	err = a.mapError(err, key)
+	if err != nil {
+		return nil, err
+	}
+	return &readCloser{
+		r:         io.LimitReader(r, int64(*max-*min)),
+		closeFunc: r.Close,
+	}, nil
+}
+
+func (a *AwsSDKv2) Delete(
+	ctx context.Context,
+	keys ...string,
+) (
+	err error,
+) {
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	if len(keys) == 0 {
+		return nil
+	}
+	if len(keys) == 1 {
+		return a.deleteSingle(ctx, keys[0])
+	}
+
+	objs := make([]types.ObjectIdentifier, 0, 1000)
+	for _, key := range keys {
+		objs = append(objs, types.ObjectIdentifier{Key: ptrTo(key)})
+		if len(objs) == 1000 {
+			if err := a.deleteMultiObj(ctx, objs); err != nil {
+				return err
+			}
+			objs = objs[:0]
+		}
+	}
+	if err := a.deleteMultiObj(ctx, objs); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a *AwsSDKv2) deleteSingle(ctx context.Context, key string) error {
+	ctx, span := trace.Start(ctx, "AwsSDKv2.deleteSingle")
+	defer span.End()
+	_, err := a.deleteObject(
+		ctx,
+		&s3.DeleteObjectInput{
+			Bucket: ptrTo(a.bucket),
+			Key:    ptrTo(key),
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (a *AwsSDKv2) deleteMultiObj(ctx context.Context, objs []types.ObjectIdentifier) error {
+	ctx, span := trace.Start(ctx, "AwsSDKv2.deleteMultiObj")
+	defer span.End()
+	if a.disableMultiDelete.Load() {
+		return a.deleteMultiObjOneByOne(ctx, objs)
+	}
+	output, err := a.deleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: ptrTo(a.bucket),
+		Delete: &types.Delete{
+			Objects: objs,
+			// In quiet mode the response includes only keys where the delete action encountered an error.
+			Quiet: ptrTo(true),
+		},
+	})
+	// delete api failed
+	if err != nil {
+		if isS3APIErrorCode(err, "MalformedXML") || isS3APIMultiDeleteChecksumError(err) {
+			a.disableMultiDelete.Store(true)
+			logutil.Warn(
+				"s3 delete objects is incompatible with this endpoint, disabling multi-delete and falling back to single deletes",
+				zap.String("fs", a.name),
+				zap.String("bucket", a.bucket),
+				zap.Int("count", len(objs)),
+				zap.Error(err),
+			)
+			return a.deleteMultiObjOneByOne(ctx, objs)
+		}
+		return err
+	}
+	// delete api success, but with delete file failed.
+	message := strings.Builder{}
+	if len(output.Errors) > 0 {
+		for _, Error := range output.Errors {
+			if *Error.Code == (*types.NoSuchKey)(nil).ErrorCode() {
+				continue
+			}
+			message.WriteString(fmt.Sprintf("%s: %s, %s;", *Error.Key, *Error.Code, *Error.Message))
+		}
+	}
+	if message.Len() > 0 {
+		return moerr.NewInternalErrorNoCtxf("S3 Delete failed: %s", message.String())
+	}
+	return nil
+}
+
+// Newer AWS SDK v2 releases use CRC32 for the required DeleteObjects checksum,
+// while older SDKs sent Content-MD5. Some S3-compatible endpoints reject the
+// newer request with one of these request-level errors. Treat that response as
+// endpoint incompatibility, fall back to individual DeleteObject calls, and
+// disable batching for later calls.
+func isS3APIMultiDeleteChecksumError(err error) bool {
+	for _, code := range []string{"MissingContentMD5", "MissingArgument", "InvalidDigest", "BadDigest", "InvalidRequest", "BadRequest"} {
+		if isS3APIErrorCode(err, code) {
+			return true
+		}
+	}
+	// Some S3-compatible endpoints surface the missing-header rejection as a
+	// generic BadRequest or return the detail without a structured S3 error code.
+	// Keep the fallback narrow to this compatibility signal instead of treating
+	// arbitrary 4xx responses as a reason to disable batch deletes.
+	return strings.Contains(strings.ToLower(err.Error()), "content-md5")
+}
+
+func (a *AwsSDKv2) deleteMultiObjOneByOne(ctx context.Context, objs []types.ObjectIdentifier) error {
+	message := strings.Builder{}
+	for _, obj := range objs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		if obj.Key == nil {
+			return moerr.NewInternalErrorNoCtx("S3 delete fallback got nil key")
+		}
+
+		if err := a.deleteSingle(ctx, *obj.Key); err != nil {
+			message.WriteString(fmt.Sprintf("%s: %v;", *obj.Key, err))
+		}
+	}
+	if message.Len() > 0 {
+		return moerr.NewInternalErrorNoCtxf("S3 delete fallback failed: %s", message.String())
+	}
+	return nil
+}
+
+func (a *AwsSDKv2) listObjects(ctx context.Context, params *s3.ListObjectsInput, optFns ...func(*s3.Options)) (*s3.ListObjectsOutput, error) {
+	ctx, task := gotrace.NewTask(ctx, "AwsSDKv2.listObjects")
+	defer task.End()
+	return DoWithRetryContext(
+		ctx,
+		"s3 list objects",
+		func() (*s3.ListObjectsOutput, error) {
+			perfcounter.Update(ctx, func(counter *perfcounter.CounterSet) {
+				counter.FileService.S3.List.Add(1)
+			}, a.perfCounterSets...)
+			return a.client.ListObjects(ctx, params, optFns...)
+		},
+		maxRetryAttemps,
+		IsRetryableError,
+	)
+}
+
+func (a *AwsSDKv2) headObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
+	ctx, task := gotrace.NewTask(ctx, "AwsSDKv2.headObject")
+	defer task.End()
+	return DoWithRetryContext(
+		ctx,
+		"s3 head object",
+		func() (*s3.HeadObjectOutput, error) {
+			perfcounter.Update(ctx, func(counter *perfcounter.CounterSet) {
+				counter.FileService.S3.Head.Add(1)
+			}, a.perfCounterSets...)
+			return a.client.HeadObject(ctx, params, optFns...)
+		},
+		maxRetryAttemps,
+		IsRetryableError,
+	)
+}
+
+func (a *AwsSDKv2) putObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	ctx, task := gotrace.NewTask(ctx, "AwsSDKv2.putObject")
+	defer task.End()
+	recordS3PutRequest(ctx, a.perfCounterSets...)
+	// not retryable because Reader may be half consumed
+	output, err := a.client.PutObject(ctx, params, optFns...)
+	if err == nil && params.ContentLength != nil {
+		recordS3AcceptedBytes(ctx, *params.ContentLength, a.perfCounterSets...)
+	}
+	return output, err
+}
+
+func (a *AwsSDKv2) getObject(ctx context.Context, min *int64, max *int64, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (io.ReadCloser, error) {
+	ctx, task := gotrace.NewTask(ctx, "AwsSDKv2.getObject")
+	defer task.End()
+	if min == nil {
+		min = ptrTo[int64](0)
+	}
+	r, err := newRetryableReader(
+		func(offset int64) (io.ReadCloser, error) {
+			LogEvent(ctx, str_retryable_reader_new_reader_begin, offset)
+			defer LogEvent(ctx, str_retryable_reader_new_reader_end)
+			var rang string
+			if max != nil {
+				rang = fmt.Sprintf("bytes=%d-%d", offset, *max-1)
+			} else {
+				rang = fmt.Sprintf("bytes=%d-", offset)
+			}
+			params.Range = &rang
+			output, err := DoWithRetryContext(
+				ctx,
+				"s3 get object",
+				func() (*s3.GetObjectOutput, error) {
+					LogEvent(ctx, str_awssdkv2_get_object_begin)
+					defer LogEvent(ctx, str_awssdkv2_get_object_end)
+					perfcounter.Update(ctx, func(counter *perfcounter.CounterSet) {
+						counter.FileService.S3.Get.Add(1)
+					}, a.perfCounterSets...)
+					return a.client.GetObject(ctx, params, optFns...)
+				},
+				maxRetryAttemps,
+				IsRetryableError,
+			)
+			if err != nil {
+				return nil, err
+			}
+			return &readCloser{
+				r: output.Body,
+				closeFunc: func() error {
+					// drain
+					io.Copy(io.Discard, output.Body)
+					return output.Body.Close()
+				},
+			}, nil
+		},
+		*min,
+		IsRetryableError,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (a *AwsSDKv2) deleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
+	ctx, task := gotrace.NewTask(ctx, "AwsSDKv2.deleteObject")
+	defer task.End()
+	return DoWithRetryContext(
+		ctx,
+		"s3 delete object",
+		func() (*s3.DeleteObjectOutput, error) {
+			perfcounter.Update(ctx, func(counter *perfcounter.CounterSet) {
+				counter.FileService.S3.Delete.Add(1)
+			}, a.perfCounterSets...)
+			return a.client.DeleteObject(ctx, params, optFns...)
+		},
+		maxRetryAttemps,
+		IsRetryableError,
+	)
+}
+
+func (a *AwsSDKv2) deleteObjects(ctx context.Context, params *s3.DeleteObjectsInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error) {
+	ctx, task := gotrace.NewTask(ctx, "AwsSDKv2.deleteObjects")
+	defer task.End()
+	return DoWithRetryContext(
+		ctx,
+		"s3 delete objects",
+		func() (*s3.DeleteObjectsOutput, error) {
+			perfcounter.Update(ctx, func(counter *perfcounter.CounterSet) {
+				counter.FileService.S3.DeleteMulti.Add(1)
+			}, a.perfCounterSets...)
+			return a.client.DeleteObjects(ctx, params, optFns...)
+		},
+		maxRetryAttemps,
+		IsRetryableError,
+	)
+}
+
+func isS3APIErrorCode(err error, code string) bool {
+	var apiErr smithy.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode() == code
+}
+
+func (a *AwsSDKv2) mapError(err error, path string) error {
+	if err == nil {
+		return nil
+	}
+	var httpError *http.ResponseError
+	if errors.As(err, &httpError) {
+		if httpError.Response.StatusCode == 404 {
+			return moerr.NewFileNotFoundNoCtx(path)
+		}
+	}
+	return err
+}
+
+func (o ObjectStorageArguments) credentialsProviderForAwsSDKv2(
+	ctx context.Context,
+) (
+	ret aws.CredentialsProvider,
+	err error,
+) {
+
+	// cache
+	defer func() {
+		if ret != nil {
+			ret = aws.NewCredentialsCache(ret)
+		}
+	}()
+
+	defer func() {
+		// handle assume role
+		if o.RoleARN == "" {
+			return
+		}
+
+		logutil.Info("setting assume role provider")
+		// load default options
+		awsConfig, err := config.LoadDefaultConfig(ctx)
+		if err != nil {
+			panic(err)
+		}
+		if ret != nil {
+			logutil.Info("using upstream credential provider for assume role",
+				zap.Any("type", fmt.Sprintf("%T", ret)),
+			)
+			awsConfig.Credentials = ret
+		}
+
+		stsSvc := sts.NewFromConfig(awsConfig, func(options *sts.Options) {
+			if o.Region == "" {
+				options.Region = "ap-northeast-1"
+			} else {
+				options.Region = o.Region
+			}
+		})
+		provider := stscreds.NewAssumeRoleProvider(
+			stsSvc,
+			o.RoleARN,
+			func(opts *stscreds.AssumeRoleOptions) {
+				if o.ExternalID != "" {
+					opts.ExternalID = &o.ExternalID
+				}
+			},
+		)
+		_, err = provider.Retrieve(ctx)
+		if err != nil {
+			// not good
+			logutil.Info("bad assume role provider",
+				zap.Any("err", err),
+			)
+			return
+		}
+
+		// set to assume role provider
+		ret = provider
+	}()
+
+	// static credential
+	if o.KeyID != "" && o.KeySecret != "" {
+		// static
+		logutil.Info("static credential")
+		return credentials.NewStaticCredentialsProvider(o.KeyID, o.KeySecret, o.SessionToken), nil
+	}
+
+	if !o.shouldLoadDefaultCredentials() {
+		return nil, moerr.NewInvalidInputNoCtx(
+			"no valid credentials",
+		)
+	}
+
+	return
+}
+
+type awsRetryer struct {
+	upstream aws.Retryer
+}
+
+func newAWSRetryer() aws.Retryer {
+	retryer := aws.Retryer(retry.NewStandard(
+		func(opts *retry.StandardOptions) {
+			opts.RateLimiter = ratelimit.NewTokenRateLimit(math.MaxInt)
+			opts.RetryCost = 1
+			opts.RetryTimeoutCost = 1
+		},
+	))
+	return &awsRetryer{
+		upstream: retryer,
+	}
+}
+
+var _ aws.Retryer = new(awsRetryer)
+
+func (a *awsRetryer) GetInitialToken() (releaseToken func(error) error) {
+	return a.upstream.GetInitialToken()
+}
+
+func (a *awsRetryer) GetRetryToken(ctx context.Context, opErr error) (releaseToken func(error) error, err error) {
+	return a.upstream.GetRetryToken(ctx, opErr)
+}
+
+func (a *awsRetryer) IsErrorRetryable(err error) (ret bool) {
+	defer func() {
+		if ret {
+			logutil.Info("file service retry",
+				zap.Error(err),
+			)
+		}
+	}()
+	return a.upstream.IsErrorRetryable(err)
+}
+
+func (a *awsRetryer) MaxAttempts() int {
+	return a.upstream.MaxAttempts()
+}
+
+func (a *awsRetryer) RetryDelay(attempt int, opErr error) (time.Duration, error) {
+	return a.upstream.RetryDelay(attempt, opErr)
+}

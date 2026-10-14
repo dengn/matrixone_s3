@@ -1,0 +1,2060 @@
+// Copyright 2022 Matrix Origin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package frontend
+
+import (
+	"bytes"
+	"context"
+	"encoding/csv"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/parquet-go/parquet-go"
+	"github.com/prashantv/gostub"
+	"github.com/smartystreets/goconvey/convey"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/defines"
+	"github.com/matrixorigin/matrixone/pkg/geo"
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+	"github.com/matrixorigin/matrixone/pkg/testutil"
+	"github.com/stretchr/testify/require"
+)
+
+var colName1, colName2 = "DATABASE()", "VARIABLE_VALUE"
+
+func Test_initExportFileParam(t *testing.T) {
+	ep := &ExportConfig{
+		userConfig: &tree.ExportParam{
+			Lines: &tree.Lines{
+				TerminatedBy: &tree.Terminated{},
+			},
+			Fields: &tree.Fields{
+				Terminated: &tree.Terminated{},
+				EnclosedBy: &tree.EnclosedBy{},
+				EscapedBy:  &tree.EscapedBy{},
+			},
+		},
+		mrs: &MysqlResultSet{},
+	}
+
+	initExportFileParam(ep, ep.mrs)
+
+	col1 := new(MysqlColumn)
+	col1.SetName(colName1)
+	col2 := new(MysqlColumn)
+	col2.SetName(colName2)
+	ep.mrs.AddColumn(col1)
+	ep.mrs.AddColumn(col2)
+
+	ep.userConfig.ForceQuote = append(ep.userConfig.ForceQuote, colName1)
+	initExportFileParam(ep, ep.mrs)
+}
+
+func Test_openNewFile(t *testing.T) {
+	convey.Convey("openNewFile succ", t, func() {
+		ep := &ExportConfig{
+			userConfig: &tree.ExportParam{
+				Lines: &tree.Lines{
+					TerminatedBy: &tree.Terminated{},
+				},
+				Fields: &tree.Fields{
+					Terminated: &tree.Terminated{},
+					EnclosedBy: &tree.EnclosedBy{},
+					EscapedBy:  &tree.EscapedBy{},
+				},
+				Header:   true,
+				FilePath: "test/export.csv",
+			},
+			mrs: &MysqlResultSet{},
+		}
+
+		col1 := new(MysqlColumn)
+		col1.SetName(colName1)
+		col2 := new(MysqlColumn)
+		col2.SetName(colName2)
+		ep.mrs.AddColumn(col1)
+		ep.mrs.AddColumn(col2)
+
+		stubs := gostub.StubFunc(&writeDataToCSVFile, nil)
+		defer stubs.Reset()
+
+		convey.So(openNewFile(context.TODO(), ep, ep.mrs), convey.ShouldBeNil)
+	})
+}
+
+func Test_formatOutputString(t *testing.T) {
+	convey.Convey("openNewFile failed", t, func() {
+		ep := &ExportConfig{
+			userConfig: &tree.ExportParam{
+				Lines: &tree.Lines{
+					TerminatedBy: &tree.Terminated{},
+				},
+				Fields: &tree.Fields{
+					Terminated: &tree.Terminated{},
+					EnclosedBy: &tree.EnclosedBy{},
+					EscapedBy:  &tree.EscapedBy{},
+				},
+				Header:   true,
+				FilePath: "test/export.csv",
+			},
+			mrs: &MysqlResultSet{},
+		}
+		buffer := &bytes.Buffer{}
+		convey.So(formatOutputString(ep, nil, nil, '\n', true, buffer), convey.ShouldBeNil)
+	})
+}
+
+func Test_writeToCSVFile(t *testing.T) {
+	convey.Convey("writeToCSVFile case", t, func() {
+		ep := &ExportConfig{
+			userConfig: &tree.ExportParam{
+				Lines: &tree.Lines{
+					TerminatedBy: &tree.Terminated{},
+				},
+				Fields: &tree.Fields{
+					Terminated: &tree.Terminated{},
+					EnclosedBy: &tree.EnclosedBy{},
+					EscapedBy:  &tree.EscapedBy{},
+				},
+				Header:   true,
+				FilePath: "test/export.csv",
+			},
+			mrs: &MysqlResultSet{},
+		}
+
+		var output = []byte{'1', '2'}
+		ep.userConfig.MaxFileSize = 1
+		ep.Rows = 1
+		ep.hasCSVData = true
+
+		stubs := gostub.StubFunc(&Close, moerr.NewInternalError(context.TODO(), "Close error"))
+		defer stubs.Reset()
+		convey.So(writeToCSVFile(ep, output), convey.ShouldNotBeNil)
+
+		// set Close to nil and openNewFile to err
+		stubs = gostub.StubFunc(&Close, nil)
+		defer stubs.Reset()
+		stubs = gostub.StubFunc(&openNewFile, moerr.NewInternalError(context.TODO(), "openNewFile error"))
+		defer stubs.Reset()
+		convey.So(writeToCSVFile(ep, output), convey.ShouldNotBeNil)
+
+		// set Close() to nil
+		stubs = gostub.StubFunc(&Close, nil)
+		defer stubs.Reset()
+		// set openNewFile() to nil
+		stubs = gostub.StubFunc(&openNewFile, nil)
+		defer stubs.Reset()
+		// set writeDataToCSVFile to nil
+		stubs = gostub.StubFunc(&writeDataToCSVFile, nil)
+		defer stubs.Reset()
+		convey.So(writeToCSVFile(ep, output), convey.ShouldBeNil)
+
+	})
+}
+
+func Test_writeDataToCSVFile(t *testing.T) {
+	convey.Convey("writeDataToCSVFile case", t, func() {
+		ep := &ExportConfig{
+			userConfig: &tree.ExportParam{
+				Lines: &tree.Lines{
+					TerminatedBy: &tree.Terminated{},
+				},
+				Fields: &tree.Fields{
+					Terminated: &tree.Terminated{},
+					EnclosedBy: &tree.EnclosedBy{},
+					EscapedBy:  &tree.EscapedBy{},
+				},
+				Header:   true,
+				FilePath: "test/export.csv",
+			},
+			mrs: &MysqlResultSet{},
+		}
+
+		var output = []byte{'1', '2'}
+		stubs := gostub.StubFunc(&Write, 0, moerr.NewInternalError(context.TODO(), "writeDataToCSVFile error"))
+		defer stubs.Reset()
+
+		convey.So(writeDataToCSVFile(ep, output), convey.ShouldNotBeNil)
+
+		stubs = gostub.StubFunc(&Write, len(output), nil)
+		defer stubs.Reset()
+		convey.So(writeDataToCSVFile(ep, output), convey.ShouldBeNil)
+
+	})
+}
+
+func Test_exportDataToCSVFile(t *testing.T) {
+	convey.Convey("exportDataFromResultSetToCSVFile succ", t, func() {
+		ep := &ExportConfig{
+			userConfig: &tree.ExportParam{
+				Lines: &tree.Lines{
+					TerminatedBy: &tree.Terminated{},
+				},
+				Fields: &tree.Fields{
+					Terminated: &tree.Terminated{},
+					EnclosedBy: &tree.EnclosedBy{},
+					EscapedBy:  &tree.EscapedBy{},
+				},
+				Header:   true,
+				FilePath: "test/export.csv",
+			},
+			mrs: &MysqlResultSet{},
+		}
+
+		var col = make([]MysqlColumn, 15)
+		col[5].flag = 0
+		col[6].flag = 1 << 5
+		var colType = []defines.MysqlType{
+			defines.MYSQL_TYPE_YEAR,
+			defines.MYSQL_TYPE_YEAR,
+			defines.MYSQL_TYPE_YEAR,
+			defines.MYSQL_TYPE_SHORT,
+			defines.MYSQL_TYPE_DOUBLE,
+			defines.MYSQL_TYPE_LONGLONG,
+			defines.MYSQL_TYPE_LONGLONG,
+			defines.MYSQL_TYPE_VARCHAR,
+			defines.MYSQL_TYPE_DATE,
+			defines.MYSQL_TYPE_DATETIME,
+			defines.MYSQL_TYPE_BOOL,
+			defines.MYSQL_TYPE_DECIMAL,
+			defines.MYSQL_TYPE_JSON,
+			defines.MYSQL_TYPE_VARCHAR,
+			defines.MYSQL_TYPE_VARCHAR,
+		}
+		for i := 0; i < len(col); i++ {
+			col[i].SetColumnType(colType[i])
+			ep.mrs.AddColumn(&col[i])
+		}
+		var data = make([]interface{}, len(col))
+		data[1] = 0
+		data[2] = 1
+		data[3] = 1
+		data[4] = 1.0
+		data[5] = 1
+		data[6] = 1
+		data[7] = []byte{1}
+		data[8] = types.Date(1)
+		data[9] = "2022-02-28 23:59:59.9999"
+		data[10] = true
+		data[11] = 1.2
+		data[12], _ = types.ParseStringToByteJson(`{"a":1}`)
+		data[13] = []float32{8.560689, 6.790359, 821.9778}
+		data[13] = []float64{8.560689, 6.790359, 821.9778}
+
+		ep.mrs.AddRow(data)
+
+		ep.Symbol = make([][]byte, len(col))
+		ep.ColumnFlag = make([]bool, len(col))
+
+		stubs := gostub.StubFunc(&Close, nil)
+		defer stubs.Reset()
+		stubs = gostub.StubFunc(&openNewFile, nil)
+		defer stubs.Reset()
+		stubs = gostub.StubFunc(&writeDataToCSVFile, nil)
+		defer stubs.Reset()
+
+		convey.So(exportDataFromResultSetToCSVFile(ep), convey.ShouldBeNil)
+	})
+
+	// Guards the narrow-vector export path: bf16/f16/int8 are emitted as their
+	// distinct slice types and vecuint8 as its display string (see
+	// extractRowFromVector). Before the fix the VARCHAR branch only special-cased
+	// []float32/[]float64 and then did value.([]byte) — a panic for []types.BF16 /
+	// []types.Float16 / []int8 and raw-byte corruption for []uint8.
+	convey.Convey("exportDataFromResultSetToCSVFile narrow vectors", t, func() {
+		ep := &ExportConfig{
+			userConfig: &tree.ExportParam{
+				Lines:    &tree.Lines{TerminatedBy: &tree.Terminated{}},
+				Fields:   &tree.Fields{Terminated: &tree.Terminated{}, EnclosedBy: &tree.EnclosedBy{}, EscapedBy: &tree.EscapedBy{}},
+				Header:   true,
+				FilePath: "test/export_narrow.csv",
+			},
+			mrs: &MysqlResultSet{},
+		}
+		col := make([]MysqlColumn, 4)
+		for i := range col {
+			col[i].SetColumnType(defines.MYSQL_TYPE_VARCHAR)
+			ep.mrs.AddColumn(&col[i])
+		}
+		f32 := []float32{1, 2, 3}
+		data := make([]interface{}, len(col))
+		data[0] = types.Float32ToBF16Slice(f32)                // bf16 slice
+		data[1] = types.Float32ToFloat16Slice(f32)             // f16 slice
+		data[2] = []int8{1, 2, 3}                              // int8 slice
+		data[3] = types.ArrayToString[uint8]([]uint8{1, 2, 3}) // uint8 display string
+		ep.mrs.AddRow(data)
+		ep.Symbol = make([][]byte, len(col))
+		ep.ColumnFlag = make([]bool, len(col))
+
+		stubs := gostub.StubFunc(&Close, nil)
+		defer stubs.Reset()
+		stubs = gostub.StubFunc(&openNewFile, nil)
+		defer stubs.Reset()
+		stubs = gostub.StubFunc(&writeDataToCSVFile, nil)
+		defer stubs.Reset()
+
+		convey.So(exportDataFromResultSetToCSVFile(ep), convey.ShouldBeNil)
+	})
+
+	convey.Convey("exportDataToCSVFile fail", t, func() {
+		ep := &ExportConfig{
+			userConfig: &tree.ExportParam{
+				Lines: &tree.Lines{
+					TerminatedBy: &tree.Terminated{},
+				},
+				Fields: &tree.Fields{
+					Terminated: &tree.Terminated{},
+					EnclosedBy: &tree.EnclosedBy{},
+					EscapedBy:  &tree.EscapedBy{},
+				},
+				Header:   true,
+				FilePath: "test/export.csv",
+			},
+			mrs: &MysqlResultSet{},
+		}
+
+		var col = make([]MysqlColumn, 1)
+		var colType = []defines.MysqlType{defines.MYSQL_TYPE_TIMESTAMP}
+		for i := 0; i < len(col); i++ {
+			col[i].SetColumnType(colType[i])
+			ep.mrs.AddColumn(&col[i])
+		}
+
+		var data = make([]interface{}, len(col))
+		data[0] = 1
+		ep.mrs.AddRow(data)
+		ep.Symbol = make([][]byte, len(col))
+		ep.ColumnFlag = make([]bool, len(col))
+
+		stubs := gostub.StubFunc(&Close, nil)
+		defer stubs.Reset()
+		stubs = gostub.StubFunc(&openNewFile, nil)
+		defer stubs.Reset()
+		stubs = gostub.StubFunc(&writeDataToCSVFile, nil)
+		defer stubs.Reset()
+		convey.So(exportDataFromResultSetToCSVFile(ep), convey.ShouldBeNil)
+	})
+}
+
+func TestConstructByteFormatsUnscaledFloat64WithFullPrecision(t *testing.T) {
+	convey.Convey("constructByte formats unscaled float64 with full precision", t, func() {
+		mp := mpool.MustNewZero()
+		vec := testutil.NewVector(1, types.T_float64.ToType(), mp, false, []float64{3.14159265358979})
+		bat := batch.NewWithSize(1)
+		bat.Vecs[0] = vec
+		bat.SetRowCount(1)
+
+		ep := &ExportConfig{
+			userConfig: &tree.ExportParam{
+				Fields: &tree.Fields{EnclosedBy: &tree.EnclosedBy{}},
+			},
+			Symbol:     [][]byte{{'\n'}},
+			ColumnFlag: []bool{false},
+		}
+		bytesChan := make(chan *BatchByte, 1)
+		constructByte(context.Background(), &backSession{feSessionImpl: feSessionImpl{pool: mp}}, bat, 0, bytesChan, ep)
+
+		result := <-bytesChan
+		convey.So(result.err, convey.ShouldBeNil)
+		convey.So(string(result.writeByte), convey.ShouldEqual, "3.14159265358979\n")
+	})
+}
+
+func TestExportCSVBatchSplitPreservesRows(t *testing.T) {
+	ctx := context.Background()
+	mp := mpool.MustNewZero()
+	values := []int32{1, 10, 100}
+	payload := strings.Repeat("x", 24) + "\n,y"
+	bat := batch.NewWithSize(2)
+	bat.Vecs[0] = testutil.NewVector(len(values), types.T_int32.ToType(), mp, false, values)
+	bat.Vecs[1] = testutil.NewVector(len(values), types.T_varchar.ToType(), mp, false, []string{payload, payload, payload})
+	bat.SetRowCount(len(values))
+
+	mrs := &MysqlResultSet{}
+	for _, name := range []string{"id", "payload"} {
+		column := new(MysqlColumn)
+		column.SetName(name)
+		mrs.AddColumn(column)
+	}
+	ep := &ExportConfig{
+		userConfig: &tree.ExportParam{
+			FilePath:   filepath.Join(t.TempDir(), "out_%02d.csv"),
+			SplitSize:  64,
+			Header:     true,
+			ForceQuote: []string{"payload"},
+			Fields: tree.NewFields(
+				tree.DefaultFieldsTerminated,
+				false,
+				tree.DefaultFieldsEnclosedBy[0],
+				tree.DefaultFieldsEscapedBy[0],
+			),
+			Lines: tree.NewLines("", "\n"),
+		},
+		ctx: ctx,
+		mrs: mrs,
+	}
+	initExportFileParam(ep, mrs)
+	ep.init()
+	ep.Index.Add(1)
+	require.NoError(t, openNewFile(ctx, ep, mrs))
+	t.Cleanup(func() {
+		if ep.AsyncWriter != nil {
+			_ = Close(ep)
+		}
+	})
+
+	constructByte(ctx, &backSession{feSessionImpl: feSessionImpl{pool: mp}}, bat, ep.Index.Load(), ep.ByteChan, ep)
+	require.NoError(t, exportDataFromBatchToCSVFile(ep))
+	require.NoError(t, Close(ep))
+
+	paths, err := filepath.Glob(filepath.Join(filepath.Dir(ep.userConfig.FilePath), "out_*.csv"))
+	require.NoError(t, err)
+	require.Len(t, paths, len(values))
+	gotIDs := make([]string, 0, len(paths))
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.LessOrEqual(t, len(data), int(ep.userConfig.SplitSize))
+		records, err := csv.NewReader(bytes.NewReader(data)).ReadAll()
+		require.NoError(t, err)
+		require.Len(t, records, 2, "each file should contain one header and one data record")
+		require.Equal(t, []string{"id", "payload"}, records[0])
+		require.Equal(t, payload, records[1][1])
+		gotIDs = append(gotIDs, records[1][0])
+	}
+	require.Equal(t, []string{"1", "10", "100"}, gotIDs)
+}
+
+func TestExportCSVEmptyEncodedRecordDoesNotCreateTrailingFile(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		batches [][]string
+	}{
+		{name: "empty after oversized record", batches: [][]string{{"xxxxx", ""}}},
+		{name: "empty before oversized record", batches: [][]string{{"", "xxxxx"}}},
+		{name: "empty batch before oversized record", batches: [][]string{{""}, {"xxxxx"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			mp := mpool.MustNewZero()
+			mrs := &MysqlResultSet{}
+			column := new(MysqlColumn)
+			column.SetName("value")
+			mrs.AddColumn(column)
+			ep := &ExportConfig{
+				userConfig: &tree.ExportParam{
+					FilePath:  filepath.Join(t.TempDir(), "empty_record_%02d.csv"),
+					SplitSize: 4,
+					Fields:    tree.NewFields("", false, 0, 0),
+					Lines:     tree.NewLines("", ""),
+				},
+				ctx: ctx,
+				mrs: mrs,
+			}
+			initExportFileParam(ep, mrs)
+			ep.init()
+			require.NoError(t, openNewFile(ctx, ep, mrs))
+			t.Cleanup(func() {
+				if ep.AsyncWriter != nil {
+					_ = Close(ep)
+				}
+			})
+
+			ses := &backSession{feSessionImpl: feSessionImpl{pool: mp}}
+			for _, values := range test.batches {
+				bat := batch.NewWithSize(1)
+				bat.Vecs[0] = testutil.NewVector(len(values), types.T_varchar.ToType(), mp, false, values)
+				bat.SetRowCount(len(values))
+				index := ep.Index.Add(1)
+				constructByte(ctx, ses, bat, index, ep.ByteChan, ep)
+				require.NoError(t, exportDataFromBatchToCSVFile(ep))
+			}
+			require.NoError(t, Close(ep))
+
+			paths, err := filepath.Glob(filepath.Join(filepath.Dir(ep.userConfig.FilePath), "empty_record_*.csv"))
+			require.NoError(t, err)
+			require.Len(t, paths, 1)
+			data, err := os.ReadFile(paths[0])
+			require.NoError(t, err)
+			require.Equal(t, "xxxxx", string(data))
+			require.True(t, ep.hasCSVData)
+		})
+	}
+}
+
+func TestExportCSVBatchSplitExactFitAndOversizedRecord(t *testing.T) {
+	ep := newCSVBatchTestExport(t, filepath.Join(t.TempDir(), "boundary_%02d.csv"), 15, true)
+	batch := makeCSVTestBatch("1,a\n", "2,0123456789\n", "3,b\n")
+
+	require.NoError(t, writeExportBatchToFile(ep, batch))
+	require.Equal(t, uint64(1), ep.Rows)
+	require.NoError(t, Close(ep))
+
+	paths, err := filepath.Glob(filepath.Join(filepath.Dir(ep.userConfig.FilePath), "boundary_*.csv"))
+	require.NoError(t, err)
+	require.Len(t, paths, 3)
+	wantIDs := []string{"1", "2", "3"}
+	wantSizes := []int{15, 24, 15}
+	for i, path := range paths {
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.Len(t, data, wantSizes[i])
+		records, err := csv.NewReader(bytes.NewReader(data)).ReadAll()
+		require.NoError(t, err)
+		require.Len(t, records, 2)
+		require.Equal(t, wantIDs[i], records[1][0])
+	}
+}
+
+func TestExportCSVFinalDrainPreservesOutOfOrderBatchMetadata(t *testing.T) {
+	ep := newCSVBatchTestExport(t, filepath.Join(t.TempDir(), "ordered_%02d.csv"), 17, true)
+	ep.Index.Add(2)
+	ep.ByteChan <- makeIndexedCSVTestBatch(2, "2,b\n")
+	ep.ByteChan <- makeIndexedCSVTestBatch(1, "1,a\n")
+
+	require.NoError(t, exportAllDataFromBatches(ep))
+	require.NoError(t, Close(ep))
+	paths, err := filepath.Glob(filepath.Join(filepath.Dir(ep.userConfig.FilePath), "ordered_*.csv"))
+	require.NoError(t, err)
+	require.Len(t, paths, 2)
+	for i, path := range paths {
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		records, err := csv.NewReader(bytes.NewReader(data)).ReadAll()
+		require.NoError(t, err)
+		require.Len(t, records, 2)
+		require.Equal(t, []string{"1", "2"}[i], records[1][0])
+	}
+}
+
+func TestExportCSVUnlimitedBatchUsesSingleWrite(t *testing.T) {
+	ep := &ExportConfig{
+		userConfig: &tree.ExportParam{ExportFormat: "csv"},
+	}
+	batch := makeCSVTestBatch("1,a\n", "2,b\n", "3,c\n")
+	writes := 0
+	stub := gostub.Stub(&writeDataToCSVFile, func(ep *ExportConfig, output []byte) error {
+		writes++
+		ep.CurFileSize += uint64(len(output))
+		return nil
+	})
+	defer stub.Reset()
+
+	require.NoError(t, writeExportBatchToFile(ep, batch))
+	require.Equal(t, 1, writes)
+	require.Equal(t, uint64(3), ep.Rows)
+}
+
+func TestConstructByteOmitsRowOffsetsWhenCSVIsUnlimited(t *testing.T) {
+	ctx := context.Background()
+	mp := mpool.MustNewZero()
+	mrs := &MysqlResultSet{}
+	column := new(MysqlColumn)
+	column.SetName("value")
+	mrs.AddColumn(column)
+	ep := &ExportConfig{
+		userConfig: &tree.ExportParam{
+			ExportFormat: "csv",
+			Fields:       tree.NewFields("", false, 0, 0),
+			Lines:        tree.NewLines("", ""),
+		},
+		ctx: ctx,
+		mrs: mrs,
+	}
+	initExportFileParam(ep, mrs)
+	ep.init()
+	ep.Index.Add(1)
+
+	bat := batch.NewWithSize(1)
+	bat.Vecs[0] = testutil.NewVector(3, types.T_varchar.ToType(), mp, false, []string{"a", "", "bc"})
+	bat.SetRowCount(3)
+	ses := &backSession{feSessionImpl: feSessionImpl{pool: mp}}
+	constructByte(ctx, ses, bat, ep.Index.Load(), ep.ByteChan, ep)
+	encoded := <-ep.ByteChan
+	require.NoError(t, encoded.err)
+	require.Equal(t, "abc", string(encoded.writeByte))
+
+	var written []byte
+	stub := gostub.Stub(&writeDataToCSVFile, func(ep *ExportConfig, output []byte) error {
+		written = append(written, output...)
+		ep.CurFileSize += uint64(len(output))
+		return nil
+	})
+	defer stub.Reset()
+	ep.ByteChan <- encoded
+	require.NoError(t, exportDataFromBatchToCSVFile(ep))
+	require.Equal(t, "abc", string(written))
+	require.Equal(t, uint64(3), ep.Rows, "empty encoded rows must still count")
+	require.Equal(t, int32(1), ep.WriteIndex.Load())
+	require.Empty(t, encoded.rowEnds, "unlimited CSV batches should not retain per-row offsets")
+}
+
+func TestExportCSVFiniteSplitGroupsRowsIntoOneWrite(t *testing.T) {
+	ep := &ExportConfig{
+		userConfig: &tree.ExportParam{ExportFormat: "csv", SplitSize: 8},
+	}
+	var writes []string
+	stubs := gostub.Stub(&writeDataToCSVFile, func(ep *ExportConfig, output []byte) error {
+		writes = append(writes, string(output))
+		ep.CurFileSize += uint64(len(output))
+		return nil
+	})
+	defer stubs.Reset()
+	stubs.Stub(&Close, func(*ExportConfig) error { return nil })
+	stubs.Stub(&openNewFile, func(_ context.Context, ep *ExportConfig, _ *MysqlResultSet) error {
+		ep.CurFileSize = 0
+		ep.hasCSVData = false
+		ep.Rows = 0
+		return nil
+	})
+
+	require.NoError(t, writeExportBatchToFile(ep, makeCSVTestBatch("1,a\n", "2,b\n", "3,c\n")))
+	require.Equal(t, []string{"1,a\n2,b\n", "3,c\n"}, writes)
+	require.Equal(t, uint64(1), ep.Rows)
+}
+
+func TestExportCSVFiniteSplitCoalescesRowsAfterRotation(t *testing.T) {
+	ep := &ExportConfig{
+		userConfig: &tree.ExportParam{ExportFormat: "csv", SplitSize: 8},
+		ctx:        context.Background(),
+		mrs:        &MysqlResultSet{},
+	}
+	var writes []string
+	rotations := 0
+	stubs := gostub.Stub(&writeDataToCSVFile, func(ep *ExportConfig, output []byte) error {
+		writes = append(writes, string(output))
+		ep.CurFileSize += uint64(len(output))
+		return nil
+	})
+	defer stubs.Reset()
+	stubs.Stub(&Close, func(*ExportConfig) error {
+		rotations++
+		return nil
+	})
+	stubs.Stub(&openNewFile, func(_ context.Context, ep *ExportConfig, _ *MysqlResultSet) error {
+		ep.CurFileSize = 0
+		ep.hasCSVData = false
+		ep.Rows = 0
+		return nil
+	})
+
+	records := []string{"1,a\n", "2,b\n", "3,c\n", "4,d\n", "5,e\n", "6,f\n"}
+	require.NoError(t, writeExportBatchToFile(ep, makeCSVTestBatch(records...)))
+	require.Equal(t, []string{"1,a\n2,b\n", "3,c\n4,d\n", "5,e\n6,f\n"}, writes)
+	require.Equal(t, 2, rotations)
+}
+
+func TestExportCSVBatchSplitsAreIndependentOfBatchDistribution(t *testing.T) {
+	records := []string{"1,a\n", "2,b\n", "3,c\n"}
+	export := func(name string, batches [][]string) [][]byte {
+		ep := newCSVBatchTestExport(t, filepath.Join(t.TempDir(), name+"_%02d.csv"), 8, false)
+		for _, batchRecords := range batches {
+			require.NoError(t, writeExportBatchToFile(ep, makeCSVTestBatch(batchRecords...)))
+		}
+		require.NoError(t, Close(ep))
+		paths, err := filepath.Glob(filepath.Join(filepath.Dir(ep.userConfig.FilePath), name+"_*.csv"))
+		require.NoError(t, err)
+		files := make([][]byte, 0, len(paths))
+		for _, path := range paths {
+			data, err := os.ReadFile(path)
+			require.NoError(t, err)
+			files = append(files, data)
+		}
+		return files
+	}
+
+	wholeBatch := export("whole", [][]string{records})
+	onePerBatch := export("one_per_batch", [][]string{{records[0]}, {records[1]}, {records[2]}})
+	twoThenOne := export("two_then_one", [][]string{records[:2], records[2:]})
+	require.Equal(t, wholeBatch, onePerBatch)
+	require.Equal(t, wholeBatch, twoThenOne)
+}
+
+func TestExportCSVBatchWriteErrorPreservesCompletedProgress(t *testing.T) {
+	writeErr := moerr.NewInternalError(context.Background(), "injected CSV write failure")
+	ep := &ExportConfig{
+		userConfig: &tree.ExportParam{ExportFormat: "csv", SplitSize: 4},
+		ByteChan:   make(chan *BatchByte, 1),
+		BatchMap:   make(map[int32]*BatchByte),
+	}
+	ep.Index.Store(1)
+	batch := makeCSVTestBatch("1,a\n", "2,b\n")
+	batch.index = 1
+	ep.ByteChan <- batch
+	writes := 0
+	stubs := gostub.Stub(&writeDataToCSVFile, func(ep *ExportConfig, output []byte) error {
+		writes++
+		if writes == 2 {
+			return writeErr
+		}
+		ep.CurFileSize += uint64(len(output))
+		return nil
+	})
+	defer stubs.Reset()
+	stubs.Stub(&Close, func(*ExportConfig) error { return nil })
+	stubs.Stub(&openNewFile, func(_ context.Context, ep *ExportConfig, _ *MysqlResultSet) error {
+		ep.CurFileSize = 0
+		ep.hasCSVData = false
+		ep.Rows = 0
+		return nil
+	})
+
+	require.ErrorIs(t, exportDataFromBatchToCSVFile(ep), writeErr)
+	require.Equal(t, 2, writes)
+	require.Equal(t, uint64(0), ep.Rows)
+	require.False(t, ep.hasCSVData)
+	require.Zero(t, ep.CurFileSize)
+	require.Equal(t, int32(0), ep.WriteIndex.Load())
+}
+
+func TestExportCSVRotationErrorsPreserveCompletedProgress(t *testing.T) {
+	for _, failAt := range []string{"close", "open"} {
+		t.Run(failAt, func(t *testing.T) {
+			rotationErr := moerr.NewInternalError(context.Background(), "injected CSV rotation failure")
+			ep := &ExportConfig{
+				userConfig: &tree.ExportParam{ExportFormat: "csv", SplitSize: 4},
+				ctx:        context.Background(),
+				mrs:        &MysqlResultSet{},
+				ByteChan:   make(chan *BatchByte, 1),
+				BatchMap:   make(map[int32]*BatchByte),
+			}
+			ep.Index.Store(1)
+			batch := makeCSVTestBatch("1,a\n", "2,b\n")
+			batch.index = 1
+			ep.ByteChan <- batch
+
+			writes, closes, opens := 0, 0, 0
+			stubs := gostub.Stub(&writeDataToCSVFile, func(ep *ExportConfig, output []byte) error {
+				writes++
+				ep.CurFileSize += uint64(len(output))
+				return nil
+			})
+			defer stubs.Reset()
+			stubs.Stub(&Close, func(*ExportConfig) error {
+				closes++
+				if failAt == "close" {
+					return rotationErr
+				}
+				return nil
+			})
+			stubs.Stub(&openNewFile, func(_ context.Context, _ *ExportConfig, _ *MysqlResultSet) error {
+				opens++
+				ep.CurFileSize = 0
+				ep.hasCSVData = false
+				if failAt == "open" {
+					return rotationErr
+				}
+				ep.Rows = 0
+				return nil
+			})
+
+			wantOpens := 0
+			if failAt == "open" {
+				wantOpens = 1
+			}
+			require.ErrorIs(t, exportDataFromBatchToCSVFile(ep), rotationErr)
+			require.Equal(t, 1, writes, "the row that requested rotation must not be written")
+			require.Equal(t, 1, closes)
+			require.Equal(t, wantOpens, opens)
+			require.Equal(t, uint64(1), ep.Rows)
+			require.Equal(t, failAt == "close", ep.hasCSVData)
+			if failAt == "close" {
+				require.Equal(t, uint64(4), ep.CurFileSize)
+			} else {
+				require.Zero(t, ep.CurFileSize, "openNewFile resets CurFileSize before failing")
+			}
+			require.Equal(t, int32(0), ep.WriteIndex.Load())
+		})
+	}
+}
+
+func newCSVBatchTestExport(t *testing.T, path string, splitSize uint64, header bool) *ExportConfig {
+	t.Helper()
+	ctx := context.Background()
+	mrs := &MysqlResultSet{}
+	for _, name := range []string{"id", "payload"} {
+		column := new(MysqlColumn)
+		column.SetName(name)
+		mrs.AddColumn(column)
+	}
+	ep := &ExportConfig{
+		userConfig: &tree.ExportParam{
+			FilePath:  path,
+			SplitSize: splitSize,
+			Header:    header,
+			Fields: tree.NewFields(
+				tree.DefaultFieldsTerminated,
+				false,
+				tree.DefaultFieldsEnclosedBy[0],
+				tree.DefaultFieldsEscapedBy[0],
+			),
+			Lines: tree.NewLines("", "\n"),
+		},
+		ctx: ctx,
+		mrs: mrs,
+	}
+	initExportFileParam(ep, mrs)
+	ep.init()
+	require.NoError(t, openNewFile(ctx, ep, mrs))
+	t.Cleanup(func() {
+		if ep.AsyncWriter != nil {
+			_ = Close(ep)
+		}
+	})
+	return ep
+}
+
+func makeCSVTestBatch(records ...string) *BatchByte {
+	var output []byte
+	rowEnds := make([]int, 0, len(records))
+	for _, record := range records {
+		output = append(output, record...)
+		rowEnds = append(rowEnds, len(output))
+	}
+	return &BatchByte{writeByte: output, rowEnds: rowEnds, rowCount: len(records)}
+}
+
+func makeIndexedCSVTestBatch(index int32, record string) *BatchByte {
+	batch := makeCSVTestBatch(record)
+	batch.index = index
+	return batch
+}
+
+func TestExportWorkerBatchEndsStatementAllocationOwnership(t *testing.T) {
+	mp := mpool.MustNewZero()
+	registry, err := mpool.NewAllocationAccountRegistry(1, 8)
+	require.NoError(t, err)
+	account, err := registry.Open(1 << 20)
+	require.NoError(t, err)
+	selection, err := vector.NewAllocationAccountSelection(account, 1, 1, 2, 3, 4)
+	require.NoError(t, err)
+
+	source := batch.NewWithSchema(
+		true,
+		[]string{"value"},
+		[]types.Type{types.T_int64.ToType()},
+	)
+	require.NoError(t, source.SetAllocationAccount(selection))
+	require.NoError(t, vector.AppendFixed(source.Vecs[0], int64(42), false, mp))
+	source.SetRowCount(1)
+	require.Positive(t, account.Snapshot().Used)
+
+	workerBatch, err := cloneExportWorkerBatch(source, mp)
+	require.NoError(t, err)
+	require.Nil(t, workerBatch.AllocationAccountSelection())
+	require.Nil(t, workerBatch.Vecs[0].AllocationAccountSelection())
+
+	source.Clean(mp)
+	snapshot := account.Seal()
+	require.Zero(t, snapshot.Used)
+	require.Zero(t, registry.LiveAllocationMetadata())
+	_, err = registry.Finalize(account)
+	require.NoError(t, err)
+	require.Equal(t, int64(42), vector.GetFixedAtNoTypeCheck[int64](workerBatch.Vecs[0], 0))
+	workerBatch.Clean(mp)
+	require.Zero(t, mp.CurrNB())
+}
+
+func TestJSONExportCancellationCleansBlockedWorkerBatch(t *testing.T) {
+	mp := mpool.MustNewZero()
+	bat := batch.NewOffHeapWithSize(1)
+	bat.Vecs[0] = vector.NewOffHeapVecWithType(types.T_int64.ToType())
+	require.NoError(t, vector.AppendFixed(bat.Vecs[0], int64(42), false, mp))
+	bat.SetRowCount(1)
+	require.Positive(t, mp.CurrNB())
+
+	mrs := &MysqlResultSet{}
+	column := &MysqlColumn{}
+	column.SetName("value")
+	mrs.AddColumn(column)
+	ep := &ExportConfig{mrs: mrs}
+	bytesChan := make(chan *BatchByte, 1)
+	bytesChan <- &BatchByte{index: 0}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ses := &backSession{feSessionImpl: feSessionImpl{pool: mp}}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		constructJSONLine(ctx, ses, bat, 1, bytesChan, ep)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("canceled JSON export worker remained blocked on a full channel")
+	}
+	require.Zero(t, mp.CurrNB())
+}
+
+func Test_getExportFormat(t *testing.T) {
+	convey.Convey("getExportFormat returns correct format", t, func() {
+		// Test default format (empty string returns "csv")
+		ep := &ExportConfig{
+			userConfig: &tree.ExportParam{
+				ExportFormat: "",
+			},
+		}
+		convey.So(ep.getExportFormat(), convey.ShouldEqual, "csv")
+
+		// Test explicit csv format
+		ep.userConfig.ExportFormat = "csv"
+		convey.So(ep.getExportFormat(), convey.ShouldEqual, "csv")
+
+		// Test jsonline format
+		ep.userConfig.ExportFormat = "jsonline"
+		convey.So(ep.getExportFormat(), convey.ShouldEqual, "jsonline")
+
+		// Test parquet format
+		ep.userConfig.ExportFormat = "parquet"
+		convey.So(ep.getExportFormat(), convey.ShouldEqual, "parquet")
+	})
+}
+
+func Test_vectorValueToJSON(t *testing.T) {
+	mp := mpool.MustNewZero()
+	convey.Convey("vectorValueToJSON converts types correctly", t, func() {
+		// Test bool type
+		convey.Convey("bool type", func() {
+			vec := testutil.NewVector(1, types.T_bool.ToType(), mp, false, []bool{true})
+			val, err := vectorValueToJSON(vec, 0, nil, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, true)
+		})
+
+		// Test int8 type
+		convey.Convey("int8 type", func() {
+			vec := testutil.NewVector(1, types.T_int8.ToType(), mp, false, []int8{42})
+			val, err := vectorValueToJSON(vec, 0, nil, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, int8(42))
+		})
+
+		// Test int16 type
+		convey.Convey("int16 type", func() {
+			vec := testutil.NewVector(1, types.T_int16.ToType(), mp, false, []int16{1234})
+			val, err := vectorValueToJSON(vec, 0, nil, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, int16(1234))
+		})
+
+		// Test int32 type
+		convey.Convey("int32 type", func() {
+			vec := testutil.NewVector(1, types.T_int32.ToType(), mp, false, []int32{123456})
+			val, err := vectorValueToJSON(vec, 0, nil, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, int32(123456))
+		})
+
+		// Test int64 type
+		convey.Convey("int64 type", func() {
+			vec := testutil.NewVector(1, types.T_int64.ToType(), mp, false, []int64{1234567890})
+			val, err := vectorValueToJSON(vec, 0, nil, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, int64(1234567890))
+		})
+
+		// Test uint8 type
+		convey.Convey("uint8 type", func() {
+			vec := testutil.NewVector(1, types.T_uint8.ToType(), mp, false, []uint8{255})
+			val, err := vectorValueToJSON(vec, 0, nil, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, uint8(255))
+		})
+
+		// Test uint16 type
+		convey.Convey("uint16 type", func() {
+			vec := testutil.NewVector(1, types.T_uint16.ToType(), mp, false, []uint16{65535})
+			val, err := vectorValueToJSON(vec, 0, nil, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, uint16(65535))
+		})
+
+		// Test uint32 type
+		convey.Convey("uint32 type", func() {
+			vec := testutil.NewVector(1, types.T_uint32.ToType(), mp, false, []uint32{4294967295})
+			val, err := vectorValueToJSON(vec, 0, nil, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, uint32(4294967295))
+		})
+
+		// Test uint64 type
+		convey.Convey("uint64 type", func() {
+			vec := testutil.NewVector(1, types.T_uint64.ToType(), mp, false, []uint64{18446744073709551615})
+			val, err := vectorValueToJSON(vec, 0, nil, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, uint64(18446744073709551615))
+		})
+
+		// Test float32 type
+		convey.Convey("float32 type", func() {
+			vec := testutil.NewVector(1, types.T_float32.ToType(), mp, false, []float32{3.14})
+			val, err := vectorValueToJSON(vec, 0, nil, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, float32(3.14))
+		})
+
+		// Test float64 type
+		convey.Convey("float64 type", func() {
+			vec := testutil.NewVector(1, types.T_float64.ToType(), mp, false, []float64{3.14159265359})
+			val, err := vectorValueToJSON(vec, 0, nil, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, 3.14159265359)
+		})
+
+		// Test varchar type
+		convey.Convey("varchar type", func() {
+			vec := testutil.NewVector(1, types.T_varchar.ToType(), mp, false, []string{"hello world"})
+			val, err := vectorValueToJSON(vec, 0, nil, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, "hello world")
+		})
+
+		// Test date type
+		convey.Convey("date type", func() {
+			vec := testutil.NewVector(1, types.T_date.ToType(), mp, false, []string{"2023-12-25"})
+			val, err := vectorValueToJSON(vec, 0, nil, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, "2023-12-25")
+		})
+	})
+}
+
+func TestEscapeJSONControl(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "empty string",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "normal characters",
+			input:    `{"a":"hello world 123"}`,
+			expected: `{"a":"hello world 123"}`,
+		},
+		{
+			name:     "UTF-8 characters",
+			input:    `{"a":"hello 世界 😊"}`,
+			expected: `{"a":"hello 世界 😊"}`,
+		},
+		{
+			name:     "single newline",
+			input:    `{"a":"abc` + `\n` + `def"}`,
+			expected: `{"a":"abc\\ndef"}`,
+		},
+		{
+			name:     "single carriage return",
+			input:    `{"a":"abc` + `\r` + `def"}`,
+			expected: `{"a":"abc\\rdef"}`,
+		},
+		{
+			name:     "single tab",
+			input:    `{"a":"abc` + `\t` + `def"}`,
+			expected: `{"a":"abc\\tdef"}`,
+		},
+		{
+			name:     "single form feed",
+			input:    `{"a":"abc` + `\f` + `def"}`,
+			expected: `{"a":"abc\\fdef"}`,
+		},
+		{
+			name:     "multiple newlines",
+			input:    `{"a":"abc` + `\n\n` + `def"}`,
+			expected: `{"a":"abc\\n\\ndef"}`,
+		},
+		{
+			name:     "escaped sequences unchanged",
+			input:    `{"a":"abc\\n\\r\\t\\b\\fdef"}`,
+			expected: `{"a":"abc\\\\n\\\\r\\\\t\\\\b\\\\fdef"}`,
+		},
+		{
+			name:     "mixed escaped and actual",
+			input:    `{"a":"abc\\n` + `\t` + `def\\r"}`,
+			expected: `{"a":"abc\\\\n\\tdef\\\\r"}`,
+		},
+		{
+			name:     "control at start",
+			input:    `\n` + `{"a":"def"}`,
+			expected: `\\n{"a":"def"}`,
+		},
+		{
+			name:     "control at end",
+			input:    `{"a":"def"}` + `\n`,
+			expected: `{"a":"def"}\\n`,
+		},
+		{
+			name:     "long string with controls",
+			input:    strings.Repeat("a", 10000) + `\n` + strings.Repeat("b", 10000) + `\t` + strings.Repeat("c", 10000),
+			expected: strings.Repeat("a", 10000) + `\\n` + strings.Repeat("b", 10000) + `\\t` + strings.Repeat("c", 10000),
+		},
+		{
+			name:     "backslash literal",
+			input:    `{"a":"abc\\def"}`,
+			expected: `{"a":"abc\\\\def"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := escapeJSONControlChars(tt.input)
+			if res != tt.expected {
+				t.Errorf("EscapeJSONControl(%v) =\n%v,\nwant\n%v", tt.input, res, tt.expected)
+			}
+		})
+	}
+}
+
+func Test_getExportFilePath(t *testing.T) {
+	tests := []struct {
+		name     string
+		filename string
+		fileCnt  uint
+		expected string
+	}{
+		// Legacy behavior: no format specifier
+		{
+			name:     "no format specifier, fileCnt 0",
+			filename: "output.csv",
+			fileCnt:  0,
+			expected: "output.csv",
+		},
+		{
+			name:     "no format specifier, fileCnt 1",
+			filename: "output.csv",
+			fileCnt:  1,
+			expected: "output.csv.1",
+		},
+		{
+			name:     "no format specifier, fileCnt 10",
+			filename: "output.csv",
+			fileCnt:  10,
+			expected: "output.csv.10",
+		},
+
+		// New behavior: %d format specifier
+		{
+			name:     "simple %d, fileCnt 0",
+			filename: "data_%d.csv",
+			fileCnt:  0,
+			expected: "data_0.csv",
+		},
+		{
+			name:     "simple %d, fileCnt 1",
+			filename: "data_%d.csv",
+			fileCnt:  1,
+			expected: "data_1.csv",
+		},
+		{
+			name:     "simple %d, fileCnt 9999",
+			filename: "data_%d.parquet",
+			fileCnt:  9999,
+			expected: "data_9999.parquet",
+		},
+
+		// Padded format specifier: %05d
+		{
+			name:     "%05d padding, fileCnt 0",
+			filename: "data_%05d.parquet",
+			fileCnt:  0,
+			expected: "data_00000.parquet",
+		},
+		{
+			name:     "%05d padding, fileCnt 1",
+			filename: "data_%05d.parquet",
+			fileCnt:  1,
+			expected: "data_00001.parquet",
+		},
+		{
+			name:     "%05d padding, fileCnt 12345",
+			filename: "data_%05d.parquet",
+			fileCnt:  12345,
+			expected: "data_12345.parquet",
+		},
+		{
+			name:     "%05d padding, fileCnt exceeds width",
+			filename: "data_%05d.parquet",
+			fileCnt:  123456,
+			expected: "data_123456.parquet",
+		},
+
+		// Other padding widths
+		{
+			name:     "%03d padding",
+			filename: "file_%03d.jsonl",
+			fileCnt:  7,
+			expected: "file_007.jsonl",
+		},
+		{
+			name:     "%010d zero padding",
+			filename: "file_%010d.csv",
+			fileCnt:  42,
+			expected: "file_0000000042.csv",
+		},
+
+		// Stage URL with format specifier
+		{
+			name:     "stage URL with %05d",
+			filename: "stage://bucket/data_%05d.parquet",
+			fileCnt:  1,
+			expected: "stage://bucket/data_00001.parquet",
+		},
+
+		// Multiple path components
+		{
+			name:     "path with directories",
+			filename: "/path/to/output_%04d.csv",
+			fileCnt:  99,
+			expected: "/path/to/output_0099.csv",
+		},
+
+		// Edge case: % but not a valid format specifier (should use legacy behavior)
+		{
+			name:     "percent sign but not format specifier",
+			filename: "file_100%.csv",
+			fileCnt:  1,
+			expected: "file_100%.csv.1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := getExportFilePath(tt.filename, tt.fileCnt)
+			if result != tt.expected {
+				t.Errorf("getExportFilePath(%q, %d) = %q, want %q",
+					tt.filename, tt.fileCnt, result, tt.expected)
+			}
+		})
+	}
+}
+
+func Test_getEffectiveMaxFileSize(t *testing.T) {
+	tests := []struct {
+		name        string
+		maxFileSize uint64
+		splitSize   uint64
+		expected    uint64
+	}{
+		{
+			name:        "both zero",
+			maxFileSize: 0,
+			splitSize:   0,
+			expected:    0,
+		},
+		{
+			name:        "only MaxFileSize set",
+			maxFileSize: 1024 * 1024, // 1MB
+			splitSize:   0,
+			expected:    1024 * 1024,
+		},
+		{
+			name:        "only SplitSize set",
+			maxFileSize: 0,
+			splitSize:   10 * 1024 * 1024 * 1024, // 10GB
+			expected:    10 * 1024 * 1024 * 1024,
+		},
+		{
+			name:        "SplitSize takes precedence over MaxFileSize",
+			maxFileSize: 1024 * 1024,             // 1MB
+			splitSize:   10 * 1024 * 1024 * 1024, // 10GB
+			expected:    10 * 1024 * 1024 * 1024,
+		},
+		{
+			name:        "SplitSize smaller than MaxFileSize",
+			maxFileSize: 10 * 1024 * 1024 * 1024, // 10GB
+			splitSize:   1024 * 1024,             // 1MB
+			expected:    1024 * 1024,             // SplitSize wins
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ep := &ExportConfig{
+				userConfig: &tree.ExportParam{
+					MaxFileSize: tt.maxFileSize,
+					SplitSize:   tt.splitSize,
+				},
+			}
+			result := getEffectiveMaxFileSize(ep)
+			if result != tt.expected {
+				t.Errorf("getEffectiveMaxFileSize() = %d, want %d", result, tt.expected)
+			}
+		})
+	}
+}
+
+func Test_buildParquetNode(t *testing.T) {
+	tests := []struct {
+		name     string
+		mysqlTyp defines.MysqlType
+	}{
+		{"bool", defines.MYSQL_TYPE_BOOL},
+		{"tiny", defines.MYSQL_TYPE_TINY},
+		{"short", defines.MYSQL_TYPE_SHORT},
+		{"int24", defines.MYSQL_TYPE_INT24},
+		{"long", defines.MYSQL_TYPE_LONG},
+		{"longlong", defines.MYSQL_TYPE_LONGLONG},
+		{"float", defines.MYSQL_TYPE_FLOAT},
+		{"double", defines.MYSQL_TYPE_DOUBLE},
+		{"date", defines.MYSQL_TYPE_DATE},
+		{"datetime", defines.MYSQL_TYPE_DATETIME},
+		{"timestamp", defines.MYSQL_TYPE_TIMESTAMP},
+		{"time", defines.MYSQL_TYPE_TIME},
+		{"decimal", defines.MYSQL_TYPE_DECIMAL},
+		{"varchar", defines.MYSQL_TYPE_VARCHAR},
+		{"var_string", defines.MYSQL_TYPE_VAR_STRING},
+		{"string", defines.MYSQL_TYPE_STRING},
+		{"json", defines.MYSQL_TYPE_JSON},
+		{"uuid", defines.MYSQL_TYPE_UUID},
+		{"text", defines.MYSQL_TYPE_TEXT},
+		{"blob", defines.MYSQL_TYPE_BLOB},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := buildParquetNode(tt.mysqlTyp, 0)
+			if node == nil {
+				t.Errorf("buildParquetNode(%v) returned nil", tt.mysqlTyp)
+			}
+		})
+	}
+
+	t.Run("lossless unsigned and timestamp physical types", func(t *testing.T) {
+		unsigned := buildParquetNode(defines.MYSQL_TYPE_LONGLONG, uint16(defines.UNSIGNED_FLAG))
+		require.Equal(t, parquet.ByteArray, unsigned.Type().Kind())
+		bit := buildParquetNode(defines.MYSQL_TYPE_BIT, 0)
+		require.Equal(t, parquet.ByteArray, bit.Type().Kind())
+		timestamp := buildParquetNode(defines.MYSQL_TYPE_TIMESTAMP, 0)
+		require.Equal(t, parquet.Int64, timestamp.Type().Kind())
+		require.NotNil(t, timestamp.Type().LogicalType().Timestamp)
+		require.True(t, timestamp.Type().LogicalType().Timestamp.IsAdjustedToUTC)
+	})
+}
+
+func Test_vectorValueToParquet(t *testing.T) {
+	mp := mpool.MustNewZero()
+	convey.Convey("vectorValueToParquet converts types correctly", t, func() {
+		// Test bool type
+		convey.Convey("bool type", func() {
+			vec := testutil.NewVector(1, types.T_bool.ToType(), mp, false, []bool{true})
+			val, err := vectorValueToParquet(vec, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, true)
+		})
+
+		// Test int8 type (converted to int32 for parquet)
+		convey.Convey("int8 type", func() {
+			vec := testutil.NewVector(1, types.T_int8.ToType(), mp, false, []int8{42})
+			val, err := vectorValueToParquet(vec, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, int32(42))
+		})
+
+		// Test int16 type (converted to int32 for parquet)
+		convey.Convey("int16 type", func() {
+			vec := testutil.NewVector(1, types.T_int16.ToType(), mp, false, []int16{1234})
+			val, err := vectorValueToParquet(vec, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, int32(1234))
+		})
+
+		// Test int32 type
+		convey.Convey("int32 type", func() {
+			vec := testutil.NewVector(1, types.T_int32.ToType(), mp, false, []int32{123456})
+			val, err := vectorValueToParquet(vec, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, int32(123456))
+		})
+
+		// Test int64 type
+		convey.Convey("int64 type", func() {
+			vec := testutil.NewVector(1, types.T_int64.ToType(), mp, false, []int64{1234567890})
+			val, err := vectorValueToParquet(vec, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, int64(1234567890))
+		})
+
+		// Test uint8 type (converted to int32 for parquet)
+		convey.Convey("uint8 type", func() {
+			vec := testutil.NewVector(1, types.T_uint8.ToType(), mp, false, []uint8{255})
+			val, err := vectorValueToParquet(vec, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, int32(255))
+		})
+
+		// Test uint16 type (converted to int32 for parquet)
+		convey.Convey("uint16 type", func() {
+			vec := testutil.NewVector(1, types.T_uint16.ToType(), mp, false, []uint16{65535})
+			val, err := vectorValueToParquet(vec, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, int32(65535))
+		})
+
+		// Test uint32 type (converted to int32 for parquet)
+		convey.Convey("uint32 type", func() {
+			vec := testutil.NewVector(1, types.T_uint32.ToType(), mp, false, []uint32{100000})
+			val, err := vectorValueToParquet(vec, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, int32(100000))
+		})
+
+		// Test uint64 type (encoded as decimal text for parquet)
+		convey.Convey("uint64 type", func() {
+			vec := testutil.NewVector(1, types.T_uint64.ToType(), mp, false, []uint64{^uint64(0)})
+			val, err := vectorValueToParquet(vec, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, "18446744073709551615")
+		})
+
+		convey.Convey("bit type", func() {
+			vec := testutil.NewVector(1, types.T_bit.ToType(), mp, false, []uint64{63})
+			val, err := vectorValueToParquet(vec, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, "63")
+		})
+
+		// Test float32 type
+		convey.Convey("float32 type", func() {
+			vec := testutil.NewVector(1, types.T_float32.ToType(), mp, false, []float32{3.14})
+			val, err := vectorValueToParquet(vec, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, float32(3.14))
+		})
+
+		// Test float64 type
+		convey.Convey("float64 type", func() {
+			vec := testutil.NewVector(1, types.T_float64.ToType(), mp, false, []float64{3.14159265359})
+			val, err := vectorValueToParquet(vec, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, 3.14159265359)
+		})
+
+		// Test varchar type
+		convey.Convey("varchar type", func() {
+			vec := testutil.NewVector(1, types.T_varchar.ToType(), mp, false, []string{"hello world"})
+			val, err := vectorValueToParquet(vec, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, "hello world")
+		})
+
+		// Test date type
+		convey.Convey("date type", func() {
+			vec := testutil.NewVector(1, types.T_date.ToType(), mp, false, []string{"2023-12-25"})
+			val, err := vectorValueToParquet(vec, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, "2023-12-25")
+		})
+
+		convey.Convey("timestamp type uses UTC epoch micros", func() {
+			vec := vector.NewVec(types.T_timestamp.ToType())
+			convey.So(vector.AppendFixed(vec, types.UnixMicroToTimestamp(1234567), false, mp), convey.ShouldBeNil)
+			val, err := vectorValueToParquet(vec, 0, time.FixedZone("UTC+8", 8*60*60))
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, int64(1234567))
+		})
+
+		convey.Convey("year type uses canonical string", func() {
+			vec := vector.NewVec(types.T_year.ToType())
+			convey.So(vector.AppendFixed(vec, types.MoYear(2024), false, mp), convey.ShouldBeNil)
+			val, err := vectorValueToParquet(vec, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, "2024")
+		})
+
+		convey.Convey("vector types use their string representation", func() {
+			vec32 := testutil.NewVector(1, types.New(types.T_array_float32, 2, 0), mp, false, [][]float32{{1.25, 2.5}})
+			val, err := vectorValueToParquet(vec32, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, "[1.25, 2.5]")
+
+			vec64 := testutil.NewVector(1, types.New(types.T_array_float64, 2, 0), mp, false, [][]float64{{1.25, 2.5}})
+			val, err = vectorValueToParquet(vec64, 0, nil)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(val, convey.ShouldEqual, "[1.25, 2.5]")
+		})
+	})
+}
+
+func Test_NewParquetWriter(t *testing.T) {
+	convey.Convey("NewParquetWriter creates writer correctly", t, func() {
+		// Test with nil MysqlResultSet
+		convey.Convey("nil result set returns error", func() {
+			_, err := NewParquetWriter(context.Background(), nil)
+			convey.So(err, convey.ShouldNotBeNil)
+		})
+
+		// Test with empty columns
+		convey.Convey("empty columns returns error", func() {
+			mrs := &MysqlResultSet{}
+			_, err := NewParquetWriter(context.Background(), mrs)
+			convey.So(err, convey.ShouldNotBeNil)
+		})
+
+		// Test with valid columns
+		convey.Convey("valid columns creates writer", func() {
+			mrs := &MysqlResultSet{}
+			col1 := new(MysqlColumn)
+			col1.SetName("id")
+			col1.SetColumnType(defines.MYSQL_TYPE_LONG)
+			col2 := new(MysqlColumn)
+			col2.SetName("name")
+			col2.SetColumnType(defines.MYSQL_TYPE_VARCHAR)
+			mrs.AddColumn(col1)
+			mrs.AddColumn(col2)
+
+			pw, err := NewParquetWriter(context.Background(), mrs)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(pw, convey.ShouldNotBeNil)
+			convey.So(len(pw.columnNames), convey.ShouldEqual, 2)
+			convey.So(pw.columnNames[0], convey.ShouldEqual, "id")
+			convey.So(pw.columnNames[1], convey.ShouldEqual, "name")
+		})
+
+		convey.Convey("duplicate names are rejected before schema creation", func() {
+			mrs := &MysqlResultSet{}
+			for _, name := range []string{"value", "VALUE"} {
+				col := new(MysqlColumn)
+				col.SetName(name)
+				col.SetColumnType(defines.MYSQL_TYPE_LONG)
+				mrs.AddColumn(col)
+			}
+			_, err := NewParquetWriter(context.Background(), mrs)
+			convey.So(err, convey.ShouldNotBeNil)
+			convey.So(err.Error(), convey.ShouldContainSubstring, "duplicate column name")
+		})
+	})
+}
+
+func Test_ParquetWriter_Close(t *testing.T) {
+	convey.Convey("ParquetWriter Close returns valid parquet data", t, func() {
+		mrs := &MysqlResultSet{}
+		col1 := new(MysqlColumn)
+		col1.SetName("id")
+		col1.SetColumnType(defines.MYSQL_TYPE_LONG)
+		mrs.AddColumn(col1)
+
+		pw, err := NewParquetWriter(context.Background(), mrs)
+		convey.So(err, convey.ShouldBeNil)
+
+		// Close without writing any data
+		data, err := pw.Close()
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(len(data), convey.ShouldBeGreaterThan, 0)
+		// Parquet files start with "PAR1" magic bytes
+		convey.So(string(data[:4]), convey.ShouldEqual, "PAR1")
+		file, err := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(file.NumRows(), convey.ShouldEqual, int64(0))
+	})
+}
+
+func Test_inferFormatFromSuffix(t *testing.T) {
+	convey.Convey("inferFormatFromSuffix returns correct format based on file suffix", t, func() {
+		// CSV suffixes
+		convey.So(inferFormatFromSuffix("data.csv"), convey.ShouldEqual, "csv")
+		convey.So(inferFormatFromSuffix("data.CSV"), convey.ShouldEqual, "csv")
+		convey.So(inferFormatFromSuffix("/path/to/data.csv"), convey.ShouldEqual, "csv")
+		convey.So(inferFormatFromSuffix("stage://bucket/data.csv"), convey.ShouldEqual, "csv")
+
+		// JSONLINE suffixes
+		convey.So(inferFormatFromSuffix("data.jsonl"), convey.ShouldEqual, "jsonline")
+		convey.So(inferFormatFromSuffix("data.jsonline"), convey.ShouldEqual, "jsonline")
+		convey.So(inferFormatFromSuffix("data.ndjson"), convey.ShouldEqual, "jsonline")
+		convey.So(inferFormatFromSuffix("data.JSONL"), convey.ShouldEqual, "jsonline")
+
+		// Parquet suffixes
+		convey.So(inferFormatFromSuffix("data.parquet"), convey.ShouldEqual, "parquet")
+		convey.So(inferFormatFromSuffix("data.PARQUET"), convey.ShouldEqual, "parquet")
+		convey.So(inferFormatFromSuffix("/path/to/data.parquet"), convey.ShouldEqual, "parquet")
+
+		// With split pattern %d
+		convey.So(inferFormatFromSuffix("data_%05d.csv"), convey.ShouldEqual, "csv")
+		convey.So(inferFormatFromSuffix("data_%d.jsonl"), convey.ShouldEqual, "jsonline")
+		convey.So(inferFormatFromSuffix("data_%05d.parquet"), convey.ShouldEqual, "parquet")
+
+		// Unknown suffix returns empty string
+		convey.So(inferFormatFromSuffix("data.txt"), convey.ShouldEqual, "")
+		convey.So(inferFormatFromSuffix("data.json"), convey.ShouldEqual, "")
+		convey.So(inferFormatFromSuffix("data"), convey.ShouldEqual, "")
+	})
+}
+
+func Test_validateExportFormat(t *testing.T) {
+	ctx := context.Background()
+
+	convey.Convey("validateExportFormat validates and infers format correctly", t, func() {
+		// Test 1: No FORMAT specified, infer from .csv suffix
+		convey.Convey("infer csv from suffix", func() {
+			ep := &tree.ExportParam{
+				FilePath:     "data.csv",
+				ExportFormat: "",
+			}
+			err := validateExportFormat(ctx, ep)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(ep.ExportFormat, convey.ShouldEqual, "csv")
+		})
+
+		// Test 2: No FORMAT specified, infer from .jsonl suffix
+		convey.Convey("infer jsonline from suffix", func() {
+			ep := &tree.ExportParam{
+				FilePath:     "data.jsonl",
+				ExportFormat: "",
+			}
+			err := validateExportFormat(ctx, ep)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(ep.ExportFormat, convey.ShouldEqual, "jsonline")
+		})
+
+		// Test 3: No FORMAT specified, infer from .parquet suffix
+		convey.Convey("infer parquet from suffix", func() {
+			ep := &tree.ExportParam{
+				FilePath:     "data.parquet",
+				ExportFormat: "",
+			}
+			err := validateExportFormat(ctx, ep)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(ep.ExportFormat, convey.ShouldEqual, "parquet")
+		})
+
+		// Test 4: No FORMAT specified, unknown suffix defaults to csv
+		convey.Convey("unknown suffix defaults to csv", func() {
+			ep := &tree.ExportParam{
+				FilePath:     "data.txt",
+				ExportFormat: "",
+			}
+			err := validateExportFormat(ctx, ep)
+			convey.So(err, convey.ShouldBeNil)
+			convey.So(ep.ExportFormat, convey.ShouldEqual, "csv")
+		})
+
+		// Test 5: FORMAT matches suffix - ok
+		convey.Convey("format matches suffix", func() {
+			ep := &tree.ExportParam{
+				FilePath:     "data.csv",
+				ExportFormat: "csv",
+			}
+			err := validateExportFormat(ctx, ep)
+			convey.So(err, convey.ShouldBeNil)
+		})
+
+		// Test 6: FORMAT mismatches suffix - error
+		convey.Convey("format mismatches suffix", func() {
+			ep := &tree.ExportParam{
+				FilePath:     "data.csv",
+				ExportFormat: "jsonline",
+			}
+			err := validateExportFormat(ctx, ep)
+			convey.So(err, convey.ShouldNotBeNil)
+			convey.So(err.Error(), convey.ShouldContainSubstring, "format 'jsonline' does not match file suffix '.csv'")
+		})
+
+		// Test 7: FORMAT with parquet suffix mismatch
+		convey.Convey("format csv mismatches parquet suffix", func() {
+			ep := &tree.ExportParam{
+				FilePath:     "data.parquet",
+				ExportFormat: "csv",
+			}
+			err := validateExportFormat(ctx, ep)
+			convey.So(err, convey.ShouldNotBeNil)
+			convey.So(err.Error(), convey.ShouldContainSubstring, "format 'csv' does not match file suffix '.parquet'")
+		})
+
+		// Test 8: FORMAT with unknown suffix - ok (no suffix to validate against)
+		convey.Convey("format with unknown suffix is allowed", func() {
+			ep := &tree.ExportParam{
+				FilePath:     "data.txt",
+				ExportFormat: "jsonline",
+			}
+			err := validateExportFormat(ctx, ep)
+			convey.So(err, convey.ShouldBeNil)
+		})
+
+		// Test 9: Split pattern with suffix validation
+		convey.Convey("split pattern with suffix validation", func() {
+			ep := &tree.ExportParam{
+				FilePath:     "data_%05d.parquet",
+				ExportFormat: "csv",
+			}
+			err := validateExportFormat(ctx, ep)
+			convey.So(err, convey.ShouldNotBeNil)
+		})
+
+		// Test 10: Split pattern with matching format
+		convey.Convey("split pattern with matching format", func() {
+			ep := &tree.ExportParam{
+				FilePath:     "data_%05d.parquet",
+				ExportFormat: "parquet",
+			}
+			err := validateExportFormat(ctx, ep)
+			convey.So(err, convey.ShouldBeNil)
+		})
+	})
+}
+
+func Test_ParquetWriter_Size(t *testing.T) {
+	convey.Convey("ParquetWriter Size returns current buffer size", t, func() {
+		ctx := context.Background()
+		mrs := &MysqlResultSet{}
+		col1 := new(MysqlColumn)
+		col1.SetName("id")
+		col1.SetColumnType(defines.MYSQL_TYPE_LONG)
+		col2 := new(MysqlColumn)
+		col2.SetName("name")
+		col2.SetColumnType(defines.MYSQL_TYPE_VARCHAR)
+		mrs.AddColumn(col1)
+		mrs.AddColumn(col2)
+
+		pw, err := NewParquetWriter(ctx, mrs)
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(pw, convey.ShouldNotBeNil)
+
+		// Initial size should be 0
+		convey.So(pw.Size(), convey.ShouldEqual, 0)
+
+		// After close, the buffer should have data
+		data, err := pw.Close()
+		convey.So(err, convey.ShouldBeNil)
+		convey.So(len(data), convey.ShouldBeGreaterThan, 0)
+	})
+}
+
+func Test_ParquetWriter_FlushPublishesBufferedSize(t *testing.T) {
+	ctx := context.Background()
+	mp := mpool.MustNewZero()
+	mrs := &MysqlResultSet{}
+	col := new(MysqlColumn)
+	col.SetName("id")
+	col.SetColumnType(defines.MYSQL_TYPE_LONG)
+	mrs.AddColumn(col)
+
+	pw, err := NewParquetWriter(ctx, mrs)
+	require.NoError(t, err)
+	vec := testutil.NewVector(1, types.T_int32.ToType(), mp, false, []int32{1})
+	bat := batch.NewWithSize(1)
+	bat.Vecs[0] = vec
+	bat.SetRowCount(1)
+	require.NoError(t, pw.WriteBatch(bat, mp, time.UTC))
+	require.Zero(t, pw.Size())
+	require.NoError(t, pw.Flush())
+	require.Greater(t, pw.Size(), 0)
+	_, err = pw.Close()
+	require.NoError(t, err)
+	bat.Clean(mp)
+	require.Zero(t, mp.CurrNB())
+}
+
+func TestParquetWriterYearColumnNormalizesDateVector(t *testing.T) {
+	mp := mpool.MustNewZero()
+	mrs := &MysqlResultSet{}
+	col := new(MysqlColumn)
+	col.SetName("year_val")
+	col.SetColumnType(defines.MYSQL_TYPE_YEAR)
+	mrs.AddColumn(col)
+
+	pw, err := NewParquetWriter(context.Background(), mrs)
+	require.NoError(t, err)
+	vec := vector.NewVec(types.T_date.ToType())
+	require.NoError(t, vector.AppendFixed(vec, types.DateFromCalendar(2024, 1, 1), false, mp))
+	defer vec.Free(mp)
+
+	value, err := pw.vectorValueToParquet(vec, 0, 0, time.UTC)
+	require.NoError(t, err)
+	require.Equal(t, "2024", value)
+	require.Zero(t, mp.CurrNB())
+}
+
+func TestExportParquetLargeSplitPreservesRows(t *testing.T) {
+	// Cross parquet-go's file row-group limit through the real export entry.
+	// SPLITSIZE must not turn each row into its own row group.
+	for _, rowCount := range []int{32767, 32768} {
+		t.Run(strconv.Itoa(rowCount), func(t *testing.T) {
+			var baseline []byte
+			for _, splitSize := range []uint64{0, 1 << 30} {
+				mp := mpool.MustNewZero()
+				mrs := &MysqlResultSet{}
+				col := new(MysqlColumn)
+				col.SetName("id")
+				col.SetColumnType(defines.MYSQL_TYPE_LONG)
+				mrs.AddColumn(col)
+				dir := t.TempDir()
+				ec := &ExportConfig{ctx: context.Background(), mrs: mrs, userConfig: &tree.ExportParam{
+					FilePath: filepath.Join(dir, "out_%d.parquet"), ExportFormat: "parquet", SplitSize: splitSize,
+				}}
+				execCtx := &ExecCtx{reqCtx: ec.ctx, ses: &backSession{feSessionImpl: feSessionImpl{pool: mp}}}
+				for start := 0; start < rowCount; start += 8192 {
+					end := min(start+8192, rowCount)
+					values := make([]int32, end-start)
+					for i := range values {
+						values[i] = int32(start + i)
+					}
+					bat := batch.NewWithSize(1)
+					bat.Vecs[0] = testutil.NewVector(len(values), types.T_int32.ToType(), mp, false, values)
+					bat.SetRowCount(len(values))
+					func() {
+						defer bat.Clean(mp)
+						require.NoError(t, ec.Write(execCtx, nil, bat))
+					}()
+				}
+				require.NoError(t, finalizeParquetExport(ec))
+				require.Zero(t, mp.CurrNB())
+				require.Equal(t, uint64(rowCount), ec.Rows)
+				files, err := filepath.Glob(filepath.Join(dir, "*.parquet"))
+				require.NoError(t, err)
+				require.Len(t, files, 1)
+				data, err := os.ReadFile(files[0])
+				require.NoError(t, err)
+				file, err := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
+				require.NoError(t, err)
+				require.Equal(t, int64(rowCount), file.NumRows())
+				require.Len(t, file.RowGroups(), 1)
+				rows, err := parquet.Read[struct {
+					ID int32 `parquet:"id,optional"`
+				}](bytes.NewReader(data), int64(len(data)))
+				require.NoError(t, err)
+				require.Len(t, rows, rowCount)
+				for i, row := range rows {
+					require.Equal(t, int32(i), row.ID)
+				}
+				if splitSize == 0 {
+					baseline = data
+				} else {
+					// The large target needs no intermediate row-group flushes:
+					// its storage overhead must match the unsplit export.
+					require.Equal(t, len(baseline), len(data))
+					t.Logf("rows=%d row_groups=%d bytes=%d unsplit_bytes=%d", rowCount, len(file.RowGroups()), len(data), len(baseline))
+				}
+			}
+		})
+	}
+}
+
+func TestExportParquetSplitSingleBatchPreservesRows(t *testing.T) {
+	mp := mpool.MustNewZero()
+	mrs := &MysqlResultSet{}
+	col := new(MysqlColumn)
+	col.SetName("payload")
+	col.SetColumnType(defines.MYSQL_TYPE_VARCHAR)
+	mrs.AddColumn(col)
+	values := make([]string, 32)
+	for i := range values {
+		values[i] = strings.Repeat("x", 512) + strconv.Itoa(i)
+	}
+	bat := batch.NewWithSize(1)
+	bat.Vecs[0] = testutil.NewVector(len(values), types.T_varchar.ToType(), mp, false, values)
+	bat.SetRowCount(len(values))
+	t.Cleanup(func() {
+		bat.Clean(mp)
+		require.Zero(t, mp.CurrNB())
+	})
+	dir := t.TempDir()
+	ec := &ExportConfig{ctx: context.Background(), mrs: mrs, userConfig: &tree.ExportParam{
+		FilePath: filepath.Join(dir, "out_%d.parquet"), ExportFormat: "parquet", SplitSize: 8 << 10,
+	}}
+	execCtx := &ExecCtx{reqCtx: ec.ctx, ses: &backSession{feSessionImpl: feSessionImpl{pool: mp}}}
+	require.NoError(t, ec.Write(execCtx, nil, bat))
+	require.NoError(t, finalizeParquetExport(ec))
+	require.Equal(t, uint64(len(values)), ec.Rows)
+	files, err := filepath.Glob(filepath.Join(dir, "*.parquet"))
+	require.NoError(t, err)
+	require.Greater(t, len(files), 1)
+	var got []string
+	for _, name := range files {
+		data, err := os.ReadFile(name)
+		require.NoError(t, err)
+		rows, err := parquet.Read[struct {
+			Payload string `parquet:"payload,optional"`
+		}](bytes.NewReader(data), int64(len(data)))
+		require.NoError(t, err)
+		require.NotEmpty(t, rows) // No trailing empty split file.
+		for _, row := range rows {
+			got = append(got, row.Payload)
+		}
+	}
+	require.ElementsMatch(t, values, got)
+}
+
+func Test_finalizeParquetExportAfterSplitDoesNotCreateTrailingFile(t *testing.T) {
+	ep := &ExportConfig{Rows: 1}
+	require.NoError(t, finalizeParquetExport(ep))
+}
+
+func Test_shouldSplitParquetFile(t *testing.T) {
+	convey.Convey("shouldSplitParquetFile checks if file should be split", t, func() {
+		convey.Convey("returns false when splitSize is 0", func() {
+			result := shouldSplitParquetFile(1000, 0)
+			convey.So(result, convey.ShouldBeFalse)
+		})
+
+		convey.Convey("returns false when current size is below threshold", func() {
+			result := shouldSplitParquetFile(500, 1000)
+			convey.So(result, convey.ShouldBeFalse)
+		})
+
+		convey.Convey("returns true when current size exceeds threshold", func() {
+			result := shouldSplitParquetFile(1500, 1000)
+			convey.So(result, convey.ShouldBeTrue)
+		})
+
+		convey.Convey("returns true when current size equals threshold", func() {
+			result := shouldSplitParquetFile(1000, 1000)
+			convey.So(result, convey.ShouldBeTrue)
+		})
+	})
+}
+
+func TestParquetBlobFamilySchemaAndBytes(t *testing.T) {
+	for _, mysqlType := range []defines.MysqlType{defines.MYSQL_TYPE_TINY_BLOB, defines.MYSQL_TYPE_BLOB, defines.MYSQL_TYPE_MEDIUM_BLOB, defines.MYSQL_TYPE_LONG_BLOB} {
+		for _, binary := range []bool{false, true} {
+			flag := uint16(0)
+			if binary {
+				flag = uint16(defines.BINARY_FLAG)
+			}
+			node := buildParquetNode(mysqlType, flag)
+			require.Equal(t, parquet.ByteArray, node.Type().Kind())
+			require.True(t, node.Optional())
+			if binary {
+				require.Nil(t, node.Type().LogicalType())
+			} else {
+				require.NotNil(t, node.Type().LogicalType().UTF8)
+			}
+		}
+	}
+	for _, width := range []int32{types.MaxTinyTextLen, types.MaxStringSize, types.MaxMediumTextLen, types.MaxLongTextLen} {
+		mp := mpool.MustNewZero()
+		typ := types.T_blob.ToType()
+		typ.Width = width
+		col := new(MysqlColumn)
+		col.SetName("payload")
+		require.NoError(t, setMysqlColumnTypeInfo(context.Background(), typ, col))
+		mrs := &MysqlResultSet{}
+		mrs.AddColumn(col)
+		writer, err := NewParquetWriter(context.Background(), mrs)
+		require.NoError(t, err)
+		bat := batch.NewWithSize(1)
+		bat.Vecs[0] = vector.NewVec(typ)
+		require.NoError(t, vector.AppendBytes(bat.Vecs[0], []byte{0xff, 0x00}, false, mp))
+		require.NoError(t, vector.AppendBytes(bat.Vecs[0], nil, true, mp))
+		bat.SetRowCount(2)
+		require.NoError(t, writer.WriteBatch(bat, mp, time.UTC))
+		bat.Clean(mp)
+		data, err := writer.Close()
+		require.NoError(t, err)
+		file, err := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
+		require.NoError(t, err)
+		require.Nil(t, file.Schema().Fields()[0].Type().LogicalType())
+		reader := parquet.NewGenericReader[struct {
+			Payload []byte `parquet:"payload,optional"`
+		}](bytes.NewReader(data))
+		rows := make([]struct {
+			Payload []byte `parquet:"payload,optional"`
+		}, 2)
+		n, err := reader.Read(rows)
+		require.ErrorIs(t, err, io.EOF)
+		require.Equal(t, 2, n)
+		require.Equal(t, []byte{0xff, 0x00}, rows[0].Payload)
+		require.Nil(t, rows[1].Payload)
+		require.NoError(t, reader.Close())
+		require.Zero(t, mp.CurrNB())
+	}
+}
+
+func TestParquetWriterExtendedTypes(t *testing.T) {
+	point := geo.Point{X: 1.0000001192092896, Y: -2.5}
+	point32, err := geo.WriteWKBFloat32(point)
+	require.NoError(t, err)
+	tests := []struct {
+		name string
+		typ  types.Type
+		data []byte
+		want string
+	}{
+		{"geometry SRID", types.New(types.T_geometry, 4327, int32(geo.POINT)), geo.WriteWKB(point), "SRID=4326;POINT(1.0000001192092896 -2.5)"},
+		{"geometry32 SRID", types.New(types.T_geometry32, 4327, int32(geo.POINT)), point32, "SRID=4326;POINT(1.0000001192092896 -2.5)"},
+		{"geometry explicit zero", types.New(types.T_geometry, 1, int32(geo.POINT)), geo.WriteWKB(point), "SRID=0;POINT(1.0000001192092896 -2.5)"},
+		{"geometry undefined SRID", types.T_geometry.ToType(), geo.WriteWKB(point), "POINT(1.0000001192092896 -2.5)"},
+		{"geometry empty", types.T_geometry32.ToType(), mustParquetEmptyPoint32(t), "POINT EMPTY"},
+		{"datalink", types.T_datalink.ToType(), []byte("file:///does-not-exist%20file?offset=2&size=3"), "file:///does-not-exist%20file?offset=2&size=3"},
+		{"vecbf16", types.New(types.T_array_bf16, 3, 0), types.ArrayToBytes(types.Float32ToBF16Slice([]float32{1.5, -2.5, 0})), "[1.5, -2.5, 0]"},
+		{"vecf16", types.New(types.T_array_float16, 3, 0), types.ArrayToBytes(types.Float32ToFloat16Slice([]float32{1.5, -2.5, 65504})), "[1.5, -2.5, 65504]"},
+		{"vecint8", types.New(types.T_array_int8, 3, 0), types.ArrayToBytes([]int8{-128, 0, 127}), "[-128, 0, 127]"},
+		{"vecuint8", types.New(types.T_array_uint8, 3, 0), types.ArrayToBytes([]uint8{0, 128, 255}), "[0, 128, 255]"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mp := mpool.MustNewZero()
+			col := new(MysqlColumn)
+			col.SetName("value")
+			require.NoError(t, setMysqlColumnTypeInfo(context.Background(), tc.typ, col))
+			mrs := &MysqlResultSet{}
+			mrs.AddColumn(col)
+			writer, err := NewParquetWriter(context.Background(), mrs)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, writer.writer.Close()) }()
+			func() {
+				bat := batch.NewWithSize(1)
+				defer bat.Clean(mp)
+				bat.Vecs[0] = vector.NewVec(tc.typ)
+				require.NoError(t, vector.AppendBytes(bat.Vecs[0], tc.data, false, mp))
+				require.NoError(t, vector.AppendBytes(bat.Vecs[0], nil, true, mp))
+				bat.SetRowCount(2)
+				require.NoError(t, writer.WriteBatch(bat, mp, time.UTC))
+			}()
+			data, err := writer.Close()
+			require.NoError(t, err)
+			file, err := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
+			require.NoError(t, err)
+			field := file.Schema().Fields()[0]
+			require.True(t, field.Optional())
+			require.NotNil(t, field.Type().LogicalType().UTF8)
+			// A plain Parquet reader proves the representation independently of LOAD.
+			type row struct {
+				Value *string `parquet:"value,optional"`
+			}
+			reader := parquet.NewGenericReader[row](bytes.NewReader(data))
+			defer func() { require.NoError(t, reader.Close()) }()
+			rows := make([]row, 2)
+			n, err := reader.Read(rows)
+			require.ErrorIs(t, err, io.EOF)
+			require.Equal(t, 2, n)
+			require.NotNil(t, rows[0].Value)
+			require.Equal(t, tc.want, *rows[0].Value)
+			require.Nil(t, rows[1].Value)
+			require.Zero(t, mp.CurrNB())
+		})
+	}
+}
+
+func mustParquetEmptyPoint32(t *testing.T) []byte {
+	t.Helper()
+	g, err := geo.ParseWKT("POINT EMPTY")
+	require.NoError(t, err)
+	data, err := geo.WriteWKBFloat32(g)
+	require.NoError(t, err)
+	return data
+}
